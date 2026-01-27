@@ -1,0 +1,32 @@
+[package]
+name = "edgar-defense-toolkit"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+description = "EDGAR defense tools for detecting suspicious bridge play patterns via double-dummy analysis"
+
+[dependencies]
+bridge-parsers = { git = "https://github.com/Rick-Wilson/Bridge-Parsers" }
+bridge-types = { git = "https://github.com/Rick-Wilson/bridge-types" }
+bridge-solver = { git = "https://github.com/Rick-Wilson/bridge-solver" }
+
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+csv = "1.3"
+env_logger = "0.11"
+lazy_static = "1.5"
+log = "0.4"
+rayon = "1.10"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+
+[[bin]]
+name = "bbo-csv"
+path = "src/bin/bbo_csv.rs"
+
+[[bin]]
+name = "dd-debug"
+path = "src/bin/dd_debug.rs"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+
+# Cargo lock file (for libraries)
+# Cargo.lock
+
+# Local development config (path patches)
+.cargo/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
