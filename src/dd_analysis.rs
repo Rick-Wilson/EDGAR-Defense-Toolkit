@@ -7,7 +7,7 @@ use bridge_parsers::lin::LinData;
 use bridge_parsers::{Card, Direction, Rank, Suit};
 use bridge_solver::cards::{card_of, suit_of};
 use bridge_solver::{CutoffCache, Hands, PartialTrick, PatternCache, Solver};
-use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NOTRUMP, NORTH, SOUTH, SPADE, WEST};
+use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, NOTRUMP, SOUTH, SPADE, WEST};
 use std::collections::HashMap;
 
 /// A single DD error with attribution
@@ -26,21 +26,12 @@ pub struct DdError {
 }
 
 /// Configuration for DD analysis
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DdAnalysisConfig {
     /// Whether to use mid-trick analysis (per-card DD) or trick-boundary analysis
     pub mid_trick: bool,
     /// Print debug output for DD values
     pub debug: bool,
-}
-
-impl Default for DdAnalysisConfig {
-    fn default() -> Self {
-        Self {
-            mid_trick: false,
-            debug: false,
-        }
-    }
 }
 
 impl DdAnalysisConfig {
@@ -106,7 +97,7 @@ pub struct DdCostsResult {
 /// # Arguments
 /// * `deal_pbn` - Deal in PBN format (e.g., "N:AKQ.JT9.876.5432 ...")
 /// * `cardplay` - Cardplay string with tricks separated by `|` and cards by spaces
-///                (e.g., "S4 S2 SA S5|D7 DQ DK DA|...")
+///   (e.g., "S4 S2 SA S5|D7 DQ DK DA|...")
 /// * `contract` - Contract string (e.g., "4S", "3NT", "6HX")
 /// * `declarer` - Declarer direction (e.g., "North", "S", "West")
 /// * `debug` - Whether to print debug output
@@ -121,8 +112,8 @@ pub fn compute_dd_costs(
     debug: bool,
 ) -> Result<DdCostsResult, String> {
     // Parse the deal
-    let mut current_hands = Hands::from_pbn(deal_pbn)
-        .ok_or_else(|| format!("Failed to parse deal: {}", deal_pbn))?;
+    let mut current_hands =
+        Hands::from_pbn(deal_pbn).ok_or_else(|| format!("Failed to parse deal: {}", deal_pbn))?;
 
     // Parse trump suit
     let trump = parse_trump(contract)?;
@@ -272,18 +263,10 @@ pub fn compute_dd_costs(
 
             let cost = if player_is_declarer_side {
                 // Declarer error: lost tricks (DD went down)
-                if dd_after < dd_before {
-                    dd_before - dd_after
-                } else {
-                    0
-                }
+                dd_before.saturating_sub(dd_after)
             } else {
                 // Defender error: declarer gained tricks (DD went up)
-                if dd_after > dd_before {
-                    dd_after - dd_before
-                } else {
-                    0
-                }
+                dd_after.saturating_sub(dd_before)
             };
 
             card_costs.push(cost);
@@ -348,7 +331,8 @@ pub fn analyze_board(lin_data: &LinData, config: &DdAnalysisConfig) -> Option<Dd
 
     if config.mid_trick {
         // Mid-trick mode: use shared compute_dd_costs function
-        let dd_result = compute_dd_costs(&pbn, &cardplay, &contract, &declarer, config.debug).ok()?;
+        let dd_result =
+            compute_dd_costs(&pbn, &cardplay, &contract, &declarer, config.debug).ok()?;
 
         // Parse cardplay to get cards for error attribution
         let tricks = parse_cardplay(&cardplay).ok()?;
@@ -358,7 +342,9 @@ pub fn analyze_board(lin_data: &LinData, config: &DdAnalysisConfig) -> Option<Dd
         let initial_leader = (dd_result.declarer_seat + 1) % 4;
         let mut current_leader = initial_leader;
 
-        for (trick_idx, (trick_costs, trick_cards)) in dd_result.costs.iter().zip(tricks.iter()).enumerate() {
+        for (trick_idx, (trick_costs, trick_cards)) in
+            dd_result.costs.iter().zip(tricks.iter()).enumerate()
+        {
             let mut seat = current_leader;
 
             for (card_idx, (cost, card)) in trick_costs.iter().zip(trick_cards.iter()).enumerate() {
@@ -657,11 +643,9 @@ fn solve_mid_trick(
 }
 
 fn extract_board_number(header: &Option<String>) -> Option<usize> {
-    header.as_ref().and_then(|h| {
-        h.split_whitespace()
-            .last()
-            .and_then(|n| n.parse().ok())
-    })
+    header
+        .as_ref()
+        .and_then(|h| h.split_whitespace().last().and_then(|n| n.parse().ok()))
 }
 
 fn extract_contract(lin_data: &LinData) -> String {
@@ -697,7 +681,7 @@ fn extract_contract(lin_data: &LinData) -> String {
     if redoubled {
         contract.push_str("XX");
     } else if doubled {
-        contract.push_str("X");
+        contract.push('X');
     }
     contract
 }
@@ -783,8 +767,7 @@ fn parse_card_str(s: &str) -> Result<Card, String> {
         _ => return Err(format!("Invalid suit: {}", suit_char)),
     };
 
-    let rank =
-        Rank::from_char(rank_char).ok_or_else(|| format!("Invalid rank: {}", rank_char))?;
+    let rank = Rank::from_char(rank_char).ok_or_else(|| format!("Invalid rank: {}", rank_char))?;
 
     Ok(Card::new(suit, rank))
 }

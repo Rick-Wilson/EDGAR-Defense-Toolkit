@@ -10,7 +10,8 @@
 //! - `dd-debug`: Single-hand DD verification utility
 
 pub mod dd_analysis;
+pub mod pipeline;
 
 // Re-export commonly used types from dependencies
-pub use bridge_parsers::{Card, Direction, Rank, Suit};
 pub use bridge_parsers::lin::LinData;
+pub use bridge_parsers::{Card, Direction, Rank, Suit};

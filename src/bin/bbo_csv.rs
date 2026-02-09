@@ -5,22 +5,21 @@
 //! double-dummy analysis.
 
 use anyhow::{Context, Result};
-use edgar_defense_toolkit::dd_analysis::compute_dd_costs;
 use bridge_parsers::lin::parse_lin_from_url;
-use bridge_parsers::tinyurl::UrlResolver;
-use bridge_solver::{NORTH, EAST, SOUTH, WEST, SPADE, HEART, DIAMOND, CLUB};
+use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, SOUTH, SPADE, WEST};
+use edgar_defense_toolkit::dd_analysis::compute_dd_costs;
 // Card, Rank, Suit only used in #[cfg(test)] functions
 #[cfg(test)]
 use bridge_parsers::{Card, Rank, Suit};
 #[cfg(test)]
-use bridge_solver::NOTRUMP;
-#[cfg(test)]
 use bridge_solver::cards::card_of;
+#[cfg(test)]
+use bridge_solver::NOTRUMP;
 use clap::{Parser, Subcommand};
-use csv::{Reader, ReaderBuilder, Writer, StringRecord};
+use csv::{ReaderBuilder, StringRecord, Writer};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::PathBuf;
@@ -57,7 +56,10 @@ fn fix_bbo_csv_line(line: &str) -> String {
         let quoted_field = &line[last_comma_quote + 1..]; // starts with quote
 
         // Check if this quoted field has internal quotes (more than just start/end)
-        if quoted_field.len() > 2 && quoted_field.starts_with('"') && quoted_field.trim_end().ends_with('"') {
+        if quoted_field.len() > 2
+            && quoted_field.starts_with('"')
+            && quoted_field.trim_end().ends_with('"')
+        {
             let inner = &quoted_field[1..quoted_field.trim_end().len() - 1];
 
             // If inner content has quotes, replace them with single quotes
@@ -178,7 +180,11 @@ enum Commands {
 
         /// Columns containing usernames to anonymize.
         /// LIN_URL column is also processed automatically (pn| tag).
-        #[arg(long, default_value = "N,S,E,W,Ob name,Dec name,Leader", value_delimiter = ',')]
+        #[arg(
+            long,
+            default_value = "N,S,E,W,Ob name,Dec name,Leader",
+            value_delimiter = ','
+        )]
         columns: Vec<String>,
     },
 
@@ -223,15 +229,25 @@ fn main() -> Result<()> {
             batch_delay_ms,
             resume,
         } => {
-            fetch_cardplay(
-                &input,
-                &output,
-                &url_column,
+            use edgar_defense_toolkit::pipeline;
+            let config = pipeline::FetchCardplayConfig {
+                input,
+                output,
+                url_column,
                 delay_ms,
                 batch_size,
                 batch_delay_ms,
                 resume,
-            )?;
+            };
+            let summary = pipeline::fetch_cardplay(&config, |p| {
+                eprint!(
+                    "\r[{}/{}] Processing... ({} errors, {} skipped)    ",
+                    p.completed, p.total, p.errors, p.skipped
+                );
+                std::io::stderr().flush().ok();
+                true // never cancel from CLI
+            })?;
+            eprintln!("\n{}", summary);
         }
         Commands::AnalyzeDd {
             input,
@@ -266,214 +282,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn fetch_cardplay(
-    input: &PathBuf,
-    output: &PathBuf,
-    url_column: &str,
-    delay_ms: u64,
-    batch_size: usize,
-    batch_delay_ms: u64,
-    resume: bool,
-) -> Result<()> {
-    // Read and preprocess input CSV to fix BBO's malformed quoting
-    let csv_data = read_bbo_csv_fixed(input)?;
-    let mut reader = ReaderBuilder::new()
-        .flexible(true)
-        .from_reader(csv_data.as_bytes());
-    let headers = reader.headers()?.clone();
-
-    // Find the URL column index
-    let url_col_idx = headers
-        .iter()
-        .position(|h| h == url_column)
-        .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in CSV", url_column))?;
-
-    // Find the Ref # column for tracking progress
-    let ref_col_idx = headers.iter().position(|h| h == "Ref #");
-
-    // Check if input already has Cardplay/LIN_URL columns
-    let cardplay_col_idx = headers.iter().position(|h| h == "Cardplay");
-    let lin_url_col_idx = headers.iter().position(|h| h == "LIN_URL");
-
-    // If resume mode and output exists, load existing data (ref -> (lin_url, cardplay))
-    let existing_data: HashMap<String, (String, String)> = if resume && output.exists() {
-        load_existing_cardplay_data(output)?
-    } else {
-        HashMap::new()
-    };
-
-    // Prepare output headers
-    let mut output_headers = headers.clone();
-    if cardplay_col_idx.is_none() {
-        output_headers.push_field("Cardplay");
-        output_headers.push_field("LIN_URL");
-    }
-
-    // Create URL resolver
-    let mut resolver = UrlResolver::with_config(delay_ms, batch_size, batch_delay_ms);
-
-    // Count total rows for progress
-    let total_rows = count_csv_rows(input)?;
-
-    // Open output file with flexible field count to handle malformed input rows
-    let mut writer = csv::WriterBuilder::new()
-        .flexible(true)
-        .from_path(output)
-        .context("Failed to create output CSV")?;
-    writer.write_record(&output_headers)?;
-
-    let mut processed = 0;
-    let mut skipped = 0;
-    let mut errors = 0;
-
-    for (row_num, result) in reader.records().enumerate() {
-        let record = result.context("Failed to read CSV row")?;
-        processed += 1;
-
-        // Check if we have existing data for this row (resume mode)
-        let ref_id = ref_col_idx.and_then(|i| record.get(i)).unwrap_or("").to_string();
-        let existing = existing_data.get(&ref_id);
-
-        // Progress indicator
-        eprint!(
-            "\r[{}/{}] Processing... ({} errors, {} skipped)    ",
-            processed, total_rows, errors, skipped
-        );
-        std::io::stderr().flush().ok();
-
-        // Use existing data if available and valid, otherwise fetch
-        let (cardplay, lin_url) = if let Some((existing_lin, existing_cardplay)) = existing {
-            if !existing_cardplay.is_empty() && !existing_cardplay.starts_with("ERROR:") {
-                skipped += 1;
-                (existing_cardplay.clone(), existing_lin.clone())
-            } else {
-                // Re-fetch if previous attempt was an error
-                fetch_cardplay_for_url(&mut resolver, &record, url_col_idx, row_num, &mut errors)
-            }
-        } else {
-            fetch_cardplay_for_url(&mut resolver, &record, url_col_idx, row_num, &mut errors)
-        };
-
-        // Write the row with cardplay/lin_url data
-        let mut output_record: Vec<String> = record.iter().map(|s| s.to_string()).collect();
-
-        if let (Some(cp_idx), Some(lu_idx)) = (cardplay_col_idx, lin_url_col_idx) {
-            // Update existing columns
-            if cp_idx < output_record.len() {
-                output_record[cp_idx] = cardplay;
-            }
-            if lu_idx < output_record.len() {
-                output_record[lu_idx] = lin_url;
-            }
-        } else {
-            // Add new columns
-            output_record.push(cardplay);
-            output_record.push(lin_url);
-        }
-        writer.write_record(&output_record)?;
-
-        // Flush periodically for crash recovery
-        if processed % 100 == 0 {
-            writer.flush()?;
-        }
-    }
-
-    writer.flush()?;
-    eprintln!("\nDone! Processed {} rows ({} errors)", processed, errors);
-
-    Ok(())
-}
-
-fn process_url(resolver: &mut UrlResolver, url: &str) -> Result<(String, String)> {
-    // Resolve the URL if it's a shortener
-    let resolved_url = if url.contains("tinyurl.com") || url.contains("bit.ly") {
-        resolver.resolve(url)?
-    } else {
-        url.to_string()
-    };
-
-    // Parse the LIN data
-    let lin_data = parse_lin_from_url(&resolved_url)?;
-
-    // Format cardplay
-    let cardplay = lin_data.format_cardplay_by_trick();
-
-    Ok((cardplay, resolved_url))
-}
-
-/// Helper to fetch cardplay for a URL, handling errors
-fn fetch_cardplay_for_url(
-    resolver: &mut UrlResolver,
-    record: &StringRecord,
-    url_col_idx: usize,
-    row_num: usize,
-    errors: &mut usize,
-) -> (String, String) {
-    let url = record.get(url_col_idx).unwrap_or("").trim();
-
-    if url.is_empty() {
-        return (String::new(), String::new());
-    }
-
-    match process_url(resolver, url) {
-        Ok((cp, lu)) => (cp, lu),
-        Err(e) => {
-            log::warn!("Row {}: Error processing URL '{}': {}", row_num + 1, url, e);
-            *errors += 1;
-
-            // Check if rate limited and need to pause
-            if e.to_string().contains("Rate limited") {
-                eprintln!("\nRate limited - pausing for 60 seconds...");
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                resolver.reset_batch();
-            }
-
-            (format!("ERROR: {}", e), String::new())
-        }
-    }
-}
-
-/// Load existing cardplay data from output file for resume
-fn load_existing_cardplay_data(output: &PathBuf) -> Result<HashMap<String, (String, String)>> {
-    let mut data = HashMap::new();
-    let mut reader = ReaderBuilder::new()
-        .flexible(true)
-        .from_path(output)?;
-
-    let headers = reader.headers()?.clone();
-    let ref_idx = headers.iter().position(|h| h == "Ref #");
-    let lin_url_idx = headers.iter().position(|h| h == "LIN_URL");
-    let cardplay_idx = headers.iter().position(|h| h == "Cardplay");
-
-    if ref_idx.is_none() || cardplay_idx.is_none() {
-        return Ok(data);
-    }
-
-    let ref_idx = ref_idx.unwrap();
-    let cardplay_idx = cardplay_idx.unwrap();
-
-    for result in reader.records() {
-        let record = result?;
-        let ref_id = record.get(ref_idx).unwrap_or("").to_string();
-        let lin_url = lin_url_idx
-            .and_then(|i| record.get(i))
-            .unwrap_or("")
-            .to_string();
-        let cardplay = record.get(cardplay_idx).unwrap_or("").to_string();
-
-        if !ref_id.is_empty() {
-            data.insert(ref_id, (lin_url, cardplay));
-        }
-    }
-
-    Ok(data)
+fn count_csv_rows(path: &PathBuf) -> Result<usize> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    // Subtract 1 for header row
+    Ok(reader.lines().count().saturating_sub(1))
 }
 
 fn load_existing_refs(output: &PathBuf, column: &str) -> Result<HashSet<String>> {
     let mut refs = HashSet::new();
-    let mut reader = ReaderBuilder::new()
-        .flexible(true)
-        .from_path(output)?;
+    let mut reader = ReaderBuilder::new().flexible(true).from_path(output)?;
 
     let headers = reader.headers()?.clone();
     let ref_idx = headers.iter().position(|h| h == "Ref #");
@@ -498,13 +316,6 @@ fn load_existing_refs(output: &PathBuf, column: &str) -> Result<HashSet<String>>
     }
 
     Ok(refs)
-}
-
-fn count_csv_rows(path: &PathBuf) -> Result<usize> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    // Subtract 1 for header row
-    Ok(reader.lines().count().saturating_sub(1))
 }
 
 // ============================================================================
@@ -613,7 +424,8 @@ fn analyze_dd(
         }
 
         // Get Max DD from input (if column exists)
-        let max_dd: Option<i8> = col_indices.max_dd_col
+        let max_dd: Option<i8> = col_indices
+            .max_dd_col
             .and_then(|col| record.get(col))
             .and_then(|s| s.parse::<i8>().ok());
 
@@ -624,7 +436,10 @@ fn analyze_dd(
         }
 
         // Get the cardplay
-        let cardplay = record.get(col_indices.cardplay_col).unwrap_or("").to_string();
+        let cardplay = record
+            .get(col_indices.cardplay_col)
+            .unwrap_or("")
+            .to_string();
 
         if cardplay.is_empty() || cardplay.starts_with("ERROR:") {
             continue;
@@ -634,7 +449,8 @@ fn analyze_dd(
         if let Some(row_data) = extract_row_data(&record, &col_indices) {
             // Skip passout hands (contract starts with "0" or is "P" or "Pass")
             let contract_upper = row_data.contract.to_uppercase();
-            if contract_upper.starts_with("0") || contract_upper == "P" || contract_upper == "PASS" {
+            if contract_upper.starts_with("0") || contract_upper == "P" || contract_upper == "PASS"
+            {
                 skipped_passout += 1;
                 continue;
             }
@@ -700,8 +516,14 @@ fn analyze_dd(
                     computed_dd: None,
                     input_max_dd: item.max_dd,
                     ol_error: 0,
-                    plays_n: 0, plays_s: 0, plays_e: 0, plays_w: 0,
-                    errors_n: 0, errors_s: 0, errors_e: 0, errors_w: 0,
+                    plays_n: 0,
+                    plays_s: 0,
+                    plays_e: 0,
+                    plays_w: 0,
+                    errors_n: 0,
+                    errors_s: 0,
+                    errors_e: 0,
+                    errors_w: 0,
                 }
             }
         };
@@ -711,7 +533,7 @@ fn analyze_dd(
 
         // Update progress
         let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % 10 == 0 || count == to_process {
+        if count.is_multiple_of(10) || count == to_process {
             let errors = error_count.load(Ordering::Relaxed);
             eprint!(
                 "\r[{}/{}] Analyzing DD... ({} errors)    ",
@@ -737,11 +559,16 @@ fn analyze_dd(
         if !dd_col_exists {
             // Add all DD columns
             if let Some(entry) = results_map.get(&row_idx) {
-                output_record.push_field(&entry.computed_dd.map(|d| d.to_string()).unwrap_or_default());
+                output_record
+                    .push_field(&entry.computed_dd.map(|d| d.to_string()).unwrap_or_default());
                 // DD_Match: true if computed DD matches input Max DD (or empty if no Max DD)
                 let dd_match = match (entry.computed_dd, entry.input_max_dd) {
                     (Some(computed), Some(input)) if input >= 0 => {
-                        if computed as i8 == input { "true" } else { "false" }
+                        if computed as i8 == input {
+                            "true"
+                        } else {
+                            "false"
+                        }
                     }
                     _ => "", // No comparison possible (missing data or incomplete hand)
                 };
@@ -790,10 +617,7 @@ fn analyze_dd(
     writer.flush()?;
 
     let errors = error_count.load(Ordering::Relaxed);
-    eprintln!(
-        "Done! Analyzed {} rows ({} errors)",
-        to_process, errors
-    );
+    eprintln!("Done! Analyzed {} rows ({} errors)", to_process, errors);
 
     // Report DD validation statistics
     if dd_matches > 0 || !dd_mismatches.is_empty() {
@@ -840,9 +664,7 @@ fn find_required_columns(headers: &StringRecord) -> Result<ColumnIndices> {
             .ok_or_else(|| anyhow::anyhow!("Required column '{}' not found", name))
     };
 
-    let find_optional = |name: &str| -> Option<usize> {
-        headers.iter().position(|h| h == name)
-    };
+    let find_optional = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
 
     let lin_url_col = find_optional("LIN_URL");
     let contract_col = find_optional("Con");
@@ -881,15 +703,23 @@ struct RowData {
 /// Prefers explicit columns (Con, Dec, hand columns) but falls back to LIN_URL
 fn extract_row_data(record: &StringRecord, cols: &ColumnIndices) -> Option<RowData> {
     // Try to get contract and declarer from explicit columns first
-    let contract_from_col = cols.contract_col.and_then(|i| record.get(i)).map(|s| s.to_string());
-    let declarer_from_col = cols.declarer_col.and_then(|i| record.get(i)).map(|s| s.to_string());
+    let contract_from_col = cols
+        .contract_col
+        .and_then(|i| record.get(i))
+        .map(|s| s.to_string());
+    let declarer_from_col = cols
+        .declarer_col
+        .and_then(|i| record.get(i))
+        .map(|s| s.to_string());
 
     // Try to get deal from hand columns (if they contain actual hand data)
     let deal_from_hands = build_deal_from_hand_cols(record, cols);
 
     // If we have hand columns with valid data, use them
     if let Some(deal_pbn) = deal_from_hands {
-        if let (Some(contract), Some(declarer)) = (contract_from_col.clone(), declarer_from_col.clone()) {
+        if let (Some(contract), Some(declarer)) =
+            (contract_from_col.clone(), declarer_from_col.clone())
+        {
             if !contract.is_empty() && !declarer.is_empty() {
                 return Some(RowData {
                     deal_pbn,
@@ -987,7 +817,7 @@ fn extract_contract_from_lin(lin_data: &bridge_parsers::lin::LinData) -> String 
     if redoubled {
         contract.push_str("XX");
     } else if doubled {
-        contract.push_str("X");
+        contract.push('X');
     }
 
     contract
@@ -1034,8 +864,15 @@ fn extract_declarer_from_auction(lin_data: &bridge_parsers::lin::LinData) -> Str
     for (i, bid) in lin_data.auction.iter().enumerate() {
         let bid_str = bid.bid.to_uppercase();
 
-        if bid_str == "P" || bid_str == "PASS" || bid_str == "D" || bid_str == "X"
-            || bid_str == "R" || bid_str == "XX" || bid_str == "DBL" || bid_str == "RDBL" {
+        if bid_str == "P"
+            || bid_str == "PASS"
+            || bid_str == "D"
+            || bid_str == "X"
+            || bid_str == "R"
+            || bid_str == "XX"
+            || bid_str == "DBL"
+            || bid_str == "RDBL"
+        {
             continue;
         }
 
@@ -1122,31 +959,43 @@ fn compute_dd_analysis(item: &DdWorkItem) -> Result<DdAnalysisOutput> {
         &item.contract,
         &item.declarer,
         false, // no debug output
-    ).map_err(|e| anyhow::anyhow!("{}", e))?;
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if result.costs.is_empty() {
         return Ok(DdAnalysisOutput {
             analysis: String::new(),
             initial_dd: result.initial_dd,
             ol_error: 0,
-            plays_n: 0, plays_s: 0, plays_e: 0, plays_w: 0,
-            errors_n: 0, errors_s: 0, errors_e: 0, errors_w: 0,
+            plays_n: 0,
+            plays_s: 0,
+            plays_e: 0,
+            plays_w: 0,
+            errors_n: 0,
+            errors_s: 0,
+            errors_e: 0,
+            errors_w: 0,
         });
     }
 
     // Track per-seat plays and errors
-    let mut plays = [0u8; 4];  // indexed by seat constant (NORTH, EAST, SOUTH, WEST)
+    let mut plays = [0u8; 4]; // indexed by seat constant (NORTH, EAST, SOUTH, WEST)
     let mut errors = [0u8; 4];
 
     // Opening lead error: check if the first card of trick 1 cost a trick
     let ol_error = if !result.costs.is_empty() && !result.costs[0].is_empty() {
-        if result.costs[0][0] > 0 { 1 } else { 0 }
+        if result.costs[0][0] > 0 {
+            1
+        } else {
+            0
+        }
     } else {
         0
     };
 
     // Parse cardplay to track trick winners
-    let tricks: Vec<Vec<&str>> = item.cardplay
+    let tricks: Vec<Vec<&str>> = item
+        .cardplay
         .split('|')
         .filter(|s| !s.is_empty())
         .map(|t| t.split_whitespace().collect())
@@ -1173,11 +1022,9 @@ fn compute_dd_analysis(item: &DdWorkItem) -> Result<DdAnalysisOutput> {
             // For simplicity, we'll track winners using the cardplay
             // Parse trump from contract
             let trump = parse_trump_for_winner(&item.contract);
-            if let Some(winner) = determine_trick_winner_from_cards(
-                &tricks[trick_idx],
-                trump,
-                current_leader,
-            ) {
+            if let Some(winner) =
+                determine_trick_winner_from_cards(&tricks[trick_idx], trump, current_leader)
+            {
                 current_leader = winner;
             }
             // If we can't determine the winner, keep current_leader unchanged
@@ -1263,8 +1110,14 @@ fn determine_trick_winner_from_cards(
                 'Q' | 'q' => 12,
                 'J' | 'j' => 11,
                 'T' | 't' | '1' => 10,
-                '9' => 9, '8' => 8, '7' => 7, '6' => 6,
-                '5' => 5, '4' => 4, '3' => 3, '2' => 2,
+                '9' => 9,
+                '8' => 8,
+                '7' => 7,
+                '6' => 6,
+                '5' => 5,
+                '4' => 4,
+                '3' => 3,
+                '2' => 2,
                 _ => return None,
             };
             Some((suit, rank))
@@ -1303,10 +1156,8 @@ fn determine_trick_winner_from_cards(
             // No trump
             if suit == led_suit && winner_card.0 == led_suit {
                 rank > winner_card.1
-            } else if suit == led_suit {
-                true
             } else {
-                false
+                suit == led_suit
             }
         };
 
@@ -1339,7 +1190,10 @@ fn parse_trump(contract: &str) -> Result<usize> {
         }
     }
 
-    Err(anyhow::anyhow!("Could not parse trump from contract: {}", contract))
+    Err(anyhow::anyhow!(
+        "Could not parse trump from contract: {}",
+        contract
+    ))
 }
 
 #[cfg(test)]
@@ -1395,13 +1249,14 @@ fn parse_card_str(s: &str) -> Result<Card> {
         _ => return Err(anyhow::anyhow!("Invalid suit: {}", suit_char)),
     };
 
-    let rank = Rank::from_char(rank_char)
-        .ok_or_else(|| anyhow::anyhow!("Invalid rank: {}", rank_char))?;
+    let rank =
+        Rank::from_char(rank_char).ok_or_else(|| anyhow::anyhow!("Invalid rank: {}", rank_char))?;
 
     Ok(Card::new(suit, rank))
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn bridge_card_to_solver(card: Card) -> Result<usize> {
     let suit = match card.suit {
         Suit::Spades => SPADE,
@@ -1430,6 +1285,7 @@ fn bridge_card_to_solver(card: Card) -> Result<usize> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn determine_trick_winner(
     cards: &[(usize, usize)], // (seat, card)
     trump: usize,
@@ -1471,60 +1327,399 @@ fn determine_trick_winner(
 
 /// Common first names (mix of male and female)
 const FIRST_NAMES: &[&str] = &[
-    "Aaron", "Abigail", "Adam", "Adrian", "Aiden", "Alex", "Alice", "Allison",
-    "Amanda", "Amber", "Amy", "Andrea", "Andrew", "Angela", "Anna", "Anthony",
-    "Ashley", "Austin", "Barbara", "Benjamin", "Beth", "Brandon", "Brenda",
-    "Brian", "Brittany", "Bruce", "Bryan", "Caleb", "Cameron", "Carl", "Carlos",
-    "Carol", "Caroline", "Catherine", "Charles", "Charlotte", "Chelsea", "Chris",
-    "Christina", "Christine", "Christopher", "Cindy", "Claire", "Clara", "Cody",
-    "Colin", "Connor", "Craig", "Crystal", "Cynthia", "Dale", "Daniel", "Danielle",
-    "Darren", "David", "Dawn", "Deborah", "Denise", "Dennis", "Derek", "Diana",
-    "Diane", "Donald", "Donna", "Dorothy", "Douglas", "Dylan", "Edward", "Eileen",
-    "Eleanor", "Elizabeth", "Ellen", "Emily", "Emma", "Eric", "Erica", "Erin",
-    "Ethan", "Eugene", "Eva", "Evan", "Evelyn", "Frances", "Francis", "Frank",
-    "Gabriel", "Gary", "George", "Gerald", "Gloria", "Grace", "Gregory", "Hannah",
-    "Harold", "Harry", "Heather", "Helen", "Henry", "Holly", "Howard", "Ian",
-    "Isaac", "Isabella", "Jack", "Jacob", "Jacqueline", "Jake", "James", "Jamie",
-    "Jane", "Janet", "Janice", "Jason", "Jean", "Jeffrey", "Jennifer", "Jeremy",
-    "Jerry", "Jesse", "Jessica", "Jill", "Joan", "Joe", "Joel", "John", "Jonathan",
-    "Jordan", "Jose", "Joseph", "Joshua", "Joyce", "Juan", "Judith", "Julia",
-    "Julie", "Justin", "Karen", "Katherine", "Kathleen", "Kathryn", "Katie",
-    "Keith", "Kelly", "Kenneth", "Kevin", "Kim", "Kimberly", "Kyle", "Larry",
-    "Laura", "Lauren", "Lawrence", "Leah", "Leonard", "Leslie", "Lillian", "Linda",
-    "Lindsay", "Lisa", "Logan", "Lori", "Louis", "Lucas", "Lucy", "Luke", "Lynn",
-    "Madison", "Margaret", "Maria", "Marie", "Marilyn", "Mark", "Martha", "Martin",
-    "Mary", "Mason", "Matthew", "Megan", "Melanie", "Melissa", "Michael", "Michelle",
-    "Mike", "Mildred", "Monica", "Nancy", "Natalie", "Nathan", "Nicholas", "Nicole",
-    "Noah", "Norma", "Oliver", "Olivia", "Oscar", "Pamela", "Patricia", "Patrick",
-    "Paul", "Paula", "Peggy", "Peter", "Philip", "Rachel", "Ralph", "Randy",
-    "Raymond", "Rebecca", "Regina", "Richard", "Robert", "Robin", "Roger", "Ronald",
-    "Rose", "Roy", "Russell", "Ruth", "Ryan", "Samantha", "Samuel", "Sandra",
-    "Sara", "Sarah", "Scott", "Sean", "Sharon", "Shawn", "Sheila", "Shirley",
-    "Sophia", "Stephanie", "Stephen", "Steve", "Steven", "Susan", "Tammy", "Teresa",
-    "Terry", "Theresa", "Thomas", "Tiffany", "Timothy", "Tina", "Todd", "Tom",
-    "Tony", "Tracy", "Travis", "Tyler", "Valerie", "Vanessa", "Victor", "Victoria",
-    "Vincent", "Virginia", "Walter", "Wanda", "Wayne", "Wendy", "William", "Willie",
+    "Aaron",
+    "Abigail",
+    "Adam",
+    "Adrian",
+    "Aiden",
+    "Alex",
+    "Alice",
+    "Allison",
+    "Amanda",
+    "Amber",
+    "Amy",
+    "Andrea",
+    "Andrew",
+    "Angela",
+    "Anna",
+    "Anthony",
+    "Ashley",
+    "Austin",
+    "Barbara",
+    "Benjamin",
+    "Beth",
+    "Brandon",
+    "Brenda",
+    "Brian",
+    "Brittany",
+    "Bruce",
+    "Bryan",
+    "Caleb",
+    "Cameron",
+    "Carl",
+    "Carlos",
+    "Carol",
+    "Caroline",
+    "Catherine",
+    "Charles",
+    "Charlotte",
+    "Chelsea",
+    "Chris",
+    "Christina",
+    "Christine",
+    "Christopher",
+    "Cindy",
+    "Claire",
+    "Clara",
+    "Cody",
+    "Colin",
+    "Connor",
+    "Craig",
+    "Crystal",
+    "Cynthia",
+    "Dale",
+    "Daniel",
+    "Danielle",
+    "Darren",
+    "David",
+    "Dawn",
+    "Deborah",
+    "Denise",
+    "Dennis",
+    "Derek",
+    "Diana",
+    "Diane",
+    "Donald",
+    "Donna",
+    "Dorothy",
+    "Douglas",
+    "Dylan",
+    "Edward",
+    "Eileen",
+    "Eleanor",
+    "Elizabeth",
+    "Ellen",
+    "Emily",
+    "Emma",
+    "Eric",
+    "Erica",
+    "Erin",
+    "Ethan",
+    "Eugene",
+    "Eva",
+    "Evan",
+    "Evelyn",
+    "Frances",
+    "Francis",
+    "Frank",
+    "Gabriel",
+    "Gary",
+    "George",
+    "Gerald",
+    "Gloria",
+    "Grace",
+    "Gregory",
+    "Hannah",
+    "Harold",
+    "Harry",
+    "Heather",
+    "Helen",
+    "Henry",
+    "Holly",
+    "Howard",
+    "Ian",
+    "Isaac",
+    "Isabella",
+    "Jack",
+    "Jacob",
+    "Jacqueline",
+    "Jake",
+    "James",
+    "Jamie",
+    "Jane",
+    "Janet",
+    "Janice",
+    "Jason",
+    "Jean",
+    "Jeffrey",
+    "Jennifer",
+    "Jeremy",
+    "Jerry",
+    "Jesse",
+    "Jessica",
+    "Jill",
+    "Joan",
+    "Joe",
+    "Joel",
+    "John",
+    "Jonathan",
+    "Jordan",
+    "Jose",
+    "Joseph",
+    "Joshua",
+    "Joyce",
+    "Juan",
+    "Judith",
+    "Julia",
+    "Julie",
+    "Justin",
+    "Karen",
+    "Katherine",
+    "Kathleen",
+    "Kathryn",
+    "Katie",
+    "Keith",
+    "Kelly",
+    "Kenneth",
+    "Kevin",
+    "Kim",
+    "Kimberly",
+    "Kyle",
+    "Larry",
+    "Laura",
+    "Lauren",
+    "Lawrence",
+    "Leah",
+    "Leonard",
+    "Leslie",
+    "Lillian",
+    "Linda",
+    "Lindsay",
+    "Lisa",
+    "Logan",
+    "Lori",
+    "Louis",
+    "Lucas",
+    "Lucy",
+    "Luke",
+    "Lynn",
+    "Madison",
+    "Margaret",
+    "Maria",
+    "Marie",
+    "Marilyn",
+    "Mark",
+    "Martha",
+    "Martin",
+    "Mary",
+    "Mason",
+    "Matthew",
+    "Megan",
+    "Melanie",
+    "Melissa",
+    "Michael",
+    "Michelle",
+    "Mike",
+    "Mildred",
+    "Monica",
+    "Nancy",
+    "Natalie",
+    "Nathan",
+    "Nicholas",
+    "Nicole",
+    "Noah",
+    "Norma",
+    "Oliver",
+    "Olivia",
+    "Oscar",
+    "Pamela",
+    "Patricia",
+    "Patrick",
+    "Paul",
+    "Paula",
+    "Peggy",
+    "Peter",
+    "Philip",
+    "Rachel",
+    "Ralph",
+    "Randy",
+    "Raymond",
+    "Rebecca",
+    "Regina",
+    "Richard",
+    "Robert",
+    "Robin",
+    "Roger",
+    "Ronald",
+    "Rose",
+    "Roy",
+    "Russell",
+    "Ruth",
+    "Ryan",
+    "Samantha",
+    "Samuel",
+    "Sandra",
+    "Sara",
+    "Sarah",
+    "Scott",
+    "Sean",
+    "Sharon",
+    "Shawn",
+    "Sheila",
+    "Shirley",
+    "Sophia",
+    "Stephanie",
+    "Stephen",
+    "Steve",
+    "Steven",
+    "Susan",
+    "Tammy",
+    "Teresa",
+    "Terry",
+    "Theresa",
+    "Thomas",
+    "Tiffany",
+    "Timothy",
+    "Tina",
+    "Todd",
+    "Tom",
+    "Tony",
+    "Tracy",
+    "Travis",
+    "Tyler",
+    "Valerie",
+    "Vanessa",
+    "Victor",
+    "Victoria",
+    "Vincent",
+    "Virginia",
+    "Walter",
+    "Wanda",
+    "Wayne",
+    "Wendy",
+    "William",
+    "Willie",
     "Zachary",
 ];
 
 /// Common surnames
 const SURNAMES: &[&str] = &[
-    "Adams", "Allen", "Anderson", "Bailey", "Baker", "Barnes", "Bell", "Bennett",
-    "Brooks", "Brown", "Bryant", "Butler", "Campbell", "Carter", "Clark", "Coleman",
-    "Collins", "Cook", "Cooper", "Cox", "Cruz", "Davis", "Diaz", "Edwards", "Evans",
-    "Fisher", "Flores", "Ford", "Foster", "Garcia", "Gibson", "Gomez", "Gonzalez",
-    "Gordon", "Graham", "Gray", "Green", "Griffin", "Hall", "Hamilton", "Harris",
-    "Harrison", "Hayes", "Henderson", "Hernandez", "Hill", "Holmes", "Howard",
-    "Hughes", "Hunt", "Jackson", "James", "Jenkins", "Johnson", "Jones", "Jordan",
-    "Kelly", "Kennedy", "Kim", "King", "Lee", "Lewis", "Long", "Lopez", "Marshall",
-    "Martin", "Martinez", "Mason", "Matthews", "Mcdonald", "Miller", "Mitchell",
-    "Moore", "Morales", "Morgan", "Morris", "Murphy", "Murray", "Nelson", "Nguyen",
-    "Ortiz", "Owens", "Parker", "Patterson", "Perez", "Perry", "Peterson", "Phillips",
-    "Powell", "Price", "Ramirez", "Reed", "Reyes", "Reynolds", "Richardson", "Rivera",
-    "Roberts", "Robinson", "Rodriguez", "Rogers", "Ross", "Russell", "Sanchez",
-    "Sanders", "Scott", "Simmons", "Smith", "Stewart", "Sullivan", "Taylor", "Thomas",
-    "Thompson", "Torres", "Turner", "Walker", "Wallace", "Ward", "Washington",
-    "Watson", "West", "White", "Williams", "Wilson", "Wood", "Wright", "Young",
+    "Adams",
+    "Allen",
+    "Anderson",
+    "Bailey",
+    "Baker",
+    "Barnes",
+    "Bell",
+    "Bennett",
+    "Brooks",
+    "Brown",
+    "Bryant",
+    "Butler",
+    "Campbell",
+    "Carter",
+    "Clark",
+    "Coleman",
+    "Collins",
+    "Cook",
+    "Cooper",
+    "Cox",
+    "Cruz",
+    "Davis",
+    "Diaz",
+    "Edwards",
+    "Evans",
+    "Fisher",
+    "Flores",
+    "Ford",
+    "Foster",
+    "Garcia",
+    "Gibson",
+    "Gomez",
+    "Gonzalez",
+    "Gordon",
+    "Graham",
+    "Gray",
+    "Green",
+    "Griffin",
+    "Hall",
+    "Hamilton",
+    "Harris",
+    "Harrison",
+    "Hayes",
+    "Henderson",
+    "Hernandez",
+    "Hill",
+    "Holmes",
+    "Howard",
+    "Hughes",
+    "Hunt",
+    "Jackson",
+    "James",
+    "Jenkins",
+    "Johnson",
+    "Jones",
+    "Jordan",
+    "Kelly",
+    "Kennedy",
+    "Kim",
+    "King",
+    "Lee",
+    "Lewis",
+    "Long",
+    "Lopez",
+    "Marshall",
+    "Martin",
+    "Martinez",
+    "Mason",
+    "Matthews",
+    "Mcdonald",
+    "Miller",
+    "Mitchell",
+    "Moore",
+    "Morales",
+    "Morgan",
+    "Morris",
+    "Murphy",
+    "Murray",
+    "Nelson",
+    "Nguyen",
+    "Ortiz",
+    "Owens",
+    "Parker",
+    "Patterson",
+    "Perez",
+    "Perry",
+    "Peterson",
+    "Phillips",
+    "Powell",
+    "Price",
+    "Ramirez",
+    "Reed",
+    "Reyes",
+    "Reynolds",
+    "Richardson",
+    "Rivera",
+    "Roberts",
+    "Robinson",
+    "Rodriguez",
+    "Rogers",
+    "Ross",
+    "Russell",
+    "Sanchez",
+    "Sanders",
+    "Scott",
+    "Simmons",
+    "Smith",
+    "Stewart",
+    "Sullivan",
+    "Taylor",
+    "Thomas",
+    "Thompson",
+    "Torres",
+    "Turner",
+    "Walker",
+    "Wallace",
+    "Ward",
+    "Washington",
+    "Watson",
+    "West",
+    "White",
+    "Williams",
+    "Wilson",
+    "Wood",
+    "Wright",
+    "Young",
 ];
 
 /// Anonymizer that maps usernames to fake names using keyed hashing
@@ -1599,7 +1794,10 @@ impl Anonymizer {
         // If name is already used (collision or explicit), add a number
         let mut suffix = 2;
         while self.used_names.contains(&candidate) {
-            candidate = format!("{}_{}_{}", FIRST_NAMES[first_idx], SURNAMES[surname_idx], suffix);
+            candidate = format!(
+                "{}_{}_{}",
+                FIRST_NAMES[first_idx], SURNAMES[surname_idx], suffix
+            );
             suffix += 1;
         }
 
@@ -1669,7 +1867,11 @@ fn anonymize_csv(
             .iter()
             .map(|&i| headers.get(i).unwrap_or("?"))
             .collect::<Vec<_>>(),
-        if lin_url_idx.is_some() { " + LIN_URL (embedded names)" } else { "" }
+        if lin_url_idx.is_some() {
+            " + LIN_URL (embedded names)"
+        } else {
+            ""
+        }
     );
 
     // Create anonymizer
@@ -1825,11 +2027,20 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
     let ref_num = get(ref_col);
 
     // Print header
-    println!("\n{:=^80}", format!(" Hand #{} (Ref: {}) ", row_num, ref_num));
+    println!(
+        "\n{:=^80}",
+        format!(" Hand #{} (Ref: {}) ", row_num, ref_num)
+    );
 
     // Print contract info
-    println!("\nContract: {} by {}    Result: {}", contract, declarer, result);
-    println!("Players: N={} S={} E={} W={}", north_player, south_player, east_player, west_player);
+    println!(
+        "\nContract: {} by {}    Result: {}",
+        contract, declarer, result
+    );
+    println!(
+        "Players: N={} S={} E={} W={}",
+        north_player, south_player, east_player, west_player
+    );
 
     // Print the deal in a nice format
     println!("\n{:^80}", "DEAL");
@@ -1918,8 +2129,10 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
         }
 
         // Print header
-        println!("\n{:>5} | {:^8} {:^8} {:^8} {:^8} | {:^20}",
-            "Trick", "Leader", "2nd", "3rd", "4th", "DD Cost (L/2/3/4)");
+        println!(
+            "\n{:>5} | {:^8} {:^8} {:^8} {:^8} | {:^20}",
+            "Trick", "Leader", "2nd", "3rd", "4th", "DD Cost (L/2/3/4)"
+        );
         println!("{:-<80}", "");
 
         let mut current_leader = initial_leader;
@@ -1954,9 +2167,10 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
                 "-".to_string()
             };
 
-            println!("{:>5} | {:^8} {:^8} {:^8} {:^8} | {:^20}",
+            println!(
+                "{:>5} | {:^8} {:^8} {:^8} {:^8} | {:^20}",
                 trick_num,
-                card_strs.get(0).map(|s| s.as_str()).unwrap_or("-"),
+                card_strs.first().map(|s| s.as_str()).unwrap_or("-"),
                 card_strs.get(1).map(|s| s.as_str()).unwrap_or("-"),
                 card_strs.get(2).map(|s| s.as_str()).unwrap_or("-"),
                 card_strs.get(3).map(|s| s.as_str()).unwrap_or("-"),
@@ -1965,7 +2179,9 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
 
             // Determine trick winner for next trick's leader
             // We need to look at the actual cards to determine the winner
-            if let Some(winner_seat) = determine_trick_winner_for_display(&cards, current_leader, contract) {
+            if let Some(winner_seat) =
+                determine_trick_winner_for_display(&cards, current_leader, contract)
+            {
                 current_leader = winner_seat;
             }
         }
@@ -2012,7 +2228,9 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
                     // Determine next leader
                     if trick_idx < tricks.len() {
                         let cards: Vec<&str> = tricks[trick_idx].split_whitespace().collect();
-                        if let Some(winner) = determine_trick_winner_for_display(&cards, current_leader, contract) {
+                        if let Some(winner) =
+                            determine_trick_winner_for_display(&cards, current_leader, contract)
+                        {
                             current_leader = winner;
                         }
                     }
@@ -2027,16 +2245,26 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
             _ => ['?', '?'],
         };
 
-        println!("\n{:<10} {:>10} {:>10} {:>12} {:>10}", "Seat", "Plays", "Errors", "Total Cost", "Role");
+        println!(
+            "\n{:<10} {:>10} {:>10} {:>12} {:>10}",
+            "Seat", "Plays", "Errors", "Total Cost", "Role"
+        );
         println!("{:-<60}", "");
 
         for seat in ['N', 'E', 'S', 'W'] {
             let plays = seat_plays.get(&seat).unwrap_or(&0);
             let errors = seat_errors.get(&seat).unwrap_or(&0);
             let cost = seat_costs.get(&seat).unwrap_or(&0);
-            let role = if declaring_seats.contains(&seat) { "Declaring" } else { "Defending" };
+            let role = if declaring_seats.contains(&seat) {
+                "Declaring"
+            } else {
+                "Defending"
+            };
 
-            println!("{:<10} {:>10} {:>10} {:>12} {:>10}", seat, plays, errors, cost, role);
+            println!(
+                "{:<10} {:>10} {:>10} {:>12} {:>10}",
+                seat, plays, errors, cost, role
+            );
         }
     } else if dd_analysis.starts_with("ERROR") {
         println!("\n{:=^80}", " DD ANALYSIS ");
@@ -2049,7 +2277,11 @@ fn display_hand(input: &PathBuf, row_num: usize) -> Result<()> {
 }
 
 /// Determine trick winner based on cards played (for display purposes)
-fn determine_trick_winner_for_display(cards: &[&str], leader: char, contract: &str) -> Option<char> {
+fn determine_trick_winner_for_display(
+    cards: &[&str],
+    leader: char,
+    contract: &str,
+) -> Option<char> {
     if cards.len() != 4 {
         return None;
     }
@@ -2264,12 +2496,12 @@ fn z_test_diff_vs_baseline(subject: &PlayerStats, baseline: &PlayerStats) -> (f6
 /// Error function approximation (for p-value calculation)
 fn erf(x: f64) -> f64 {
     // Horner form coefficients for erf approximation
-    let a1 =  0.254829592;
+    let a1 = 0.254829592;
     let a2 = -0.284496736;
-    let a3 =  1.421413741;
+    let a3 = 1.421413741;
     let a4 = -1.453152027;
-    let a5 =  1.061405429;
-    let p  =  0.3275911;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
 
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -2287,33 +2519,63 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
     let headers = reader.headers()?.clone();
 
     // Find required columns
-    let n_col = headers.iter().position(|h| h == "N")
+    let n_col = headers
+        .iter()
+        .position(|h| h == "N")
         .ok_or_else(|| anyhow::anyhow!("Column 'N' not found"))?;
-    let s_col = headers.iter().position(|h| h == "S")
+    let s_col = headers
+        .iter()
+        .position(|h| h == "S")
         .ok_or_else(|| anyhow::anyhow!("Column 'S' not found"))?;
-    let e_col = headers.iter().position(|h| h == "E")
+    let e_col = headers
+        .iter()
+        .position(|h| h == "E")
         .ok_or_else(|| anyhow::anyhow!("Column 'E' not found"))?;
-    let w_col = headers.iter().position(|h| h == "W")
+    let w_col = headers
+        .iter()
+        .position(|h| h == "W")
         .ok_or_else(|| anyhow::anyhow!("Column 'W' not found"))?;
-    let dec_col = headers.iter().position(|h| h == "Dec")
+    let dec_col = headers
+        .iter()
+        .position(|h| h == "Dec")
         .ok_or_else(|| anyhow::anyhow!("Column 'Dec' not found"))?;
 
     // Find the new per-seat DD columns
-    let dd_n_plays_col = headers.iter().position(|h| h == "DD_N_Plays")
-        .ok_or_else(|| anyhow::anyhow!("Column 'DD_N_Plays' not found - run analyze-dd first with updated version"))?;
-    let dd_s_plays_col = headers.iter().position(|h| h == "DD_S_Plays")
+    let dd_n_plays_col = headers
+        .iter()
+        .position(|h| h == "DD_N_Plays")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Column 'DD_N_Plays' not found - run analyze-dd first with updated version"
+            )
+        })?;
+    let dd_s_plays_col = headers
+        .iter()
+        .position(|h| h == "DD_S_Plays")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_S_Plays' not found"))?;
-    let dd_e_plays_col = headers.iter().position(|h| h == "DD_E_Plays")
+    let dd_e_plays_col = headers
+        .iter()
+        .position(|h| h == "DD_E_Plays")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_E_Plays' not found"))?;
-    let dd_w_plays_col = headers.iter().position(|h| h == "DD_W_Plays")
+    let dd_w_plays_col = headers
+        .iter()
+        .position(|h| h == "DD_W_Plays")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_W_Plays' not found"))?;
-    let dd_n_errors_col = headers.iter().position(|h| h == "DD_N_Errors")
+    let dd_n_errors_col = headers
+        .iter()
+        .position(|h| h == "DD_N_Errors")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_N_Errors' not found"))?;
-    let dd_s_errors_col = headers.iter().position(|h| h == "DD_S_Errors")
+    let dd_s_errors_col = headers
+        .iter()
+        .position(|h| h == "DD_S_Errors")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_S_Errors' not found"))?;
-    let dd_e_errors_col = headers.iter().position(|h| h == "DD_E_Errors")
+    let dd_e_errors_col = headers
+        .iter()
+        .position(|h| h == "DD_E_Errors")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_E_Errors' not found"))?;
-    let dd_w_errors_col = headers.iter().position(|h| h == "DD_W_Errors")
+    let dd_w_errors_col = headers
+        .iter()
+        .position(|h| h == "DD_W_Errors")
         .ok_or_else(|| anyhow::anyhow!("Column 'DD_W_Errors' not found"))?;
 
     // Collect stats per player
@@ -2360,14 +2622,38 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
         }
 
         // Get per-seat DD plays and errors
-        let n_plays: u64 = record.get(dd_n_plays_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let s_plays: u64 = record.get(dd_s_plays_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let e_plays: u64 = record.get(dd_e_plays_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let w_plays: u64 = record.get(dd_w_plays_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let n_errors: u64 = record.get(dd_n_errors_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let s_errors: u64 = record.get(dd_s_errors_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let e_errors: u64 = record.get(dd_e_errors_col).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let w_errors: u64 = record.get(dd_w_errors_col).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let n_plays: u64 = record
+            .get(dd_n_plays_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let s_plays: u64 = record
+            .get(dd_s_plays_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let e_plays: u64 = record
+            .get(dd_e_plays_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let w_plays: u64 = record
+            .get(dd_w_plays_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let n_errors: u64 = record
+            .get(dd_n_errors_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let s_errors: u64 = record
+            .get(dd_s_errors_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let e_errors: u64 = record
+            .get(dd_e_errors_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let w_errors: u64 = record
+            .get(dd_w_errors_col)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         // Skip rows with no DD data (all plays are 0 means no cardplay analyzed)
         if n_plays == 0 && s_plays == 0 && e_plays == 0 && w_plays == 0 {
@@ -2376,7 +2662,7 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
         }
 
         // Determine declarer, dummy, and defenders based on declarer direction
-        let (declarer_name, dummy_name, def1_name, def2_name) = match declarer.chars().next() {
+        let (declarer_name, dummy_name, _def1_name, _def2_name) = match declarer.chars().next() {
             Some('N') => (&north, &south, &east, &west),
             Some('S') => (&south, &north, &east, &west),
             Some('E') => (&east, &west, &north, &south),
@@ -2450,7 +2736,7 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
 
     // Sort players by total deals (frequency)
     let mut players: Vec<_> = player_stats.values().cloned().collect();
-    players.sort_by(|a, b| b.total_deals().cmp(&a.total_deals()));
+    players.sort_by_key(|b| std::cmp::Reverse(b.total_deals()));
 
     // Identify top 2 players (the subjects)
     let top_2: HashSet<String> = players.iter().take(2).map(|p| p.name.clone()).collect();
@@ -2465,8 +2751,19 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
 
     // Print header
     println!("\n{:=^126}", " DD Error Rate Analysis ");
-    println!("\n{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10} {:>10} {:>8}",
-        "Player", "Deals", "Decl", "Def", "Decl Plays", "Decl Err%", "Def Plays", "Def Err%", "Diff", "Rel%");
+    println!(
+        "\n{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10} {:>10} {:>8}",
+        "Player",
+        "Deals",
+        "Decl",
+        "Def",
+        "Decl Plays",
+        "Decl Err%",
+        "Def Plays",
+        "Def Err%",
+        "Diff",
+        "Rel%"
+    );
     println!("{:-<126}", "");
 
     // Print top N players
@@ -2476,11 +2773,16 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
         let diff = decl_rate - def_rate;
         // Relative percent: how much better/worse is defense vs declaring
         // Negative means defense is better (fewer errors), positive means worse
-        let rel_pct = if decl_rate > 0.0 { -diff / decl_rate * 100.0 } else { 0.0 };
+        let rel_pct = if decl_rate > 0.0 {
+            -diff / decl_rate * 100.0
+        } else {
+            0.0
+        };
         let decl_ci = player.declaring_ci();
         let def_ci = player.defending_ci();
 
-        println!("{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
+        println!(
+            "{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
             truncate_name(&player.name, 20),
             player.total_deals(),
             player.declaring_deals,
@@ -2495,7 +2797,8 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
 
         // Print confidence intervals on separate line if enough data
         if !decl_ci.is_nan() || !def_ci.is_nan() {
-            println!("{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10}",
+            println!(
+                "{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10}",
                 "",
                 "",
                 "",
@@ -2513,9 +2816,14 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
     let decl_rate = field_stats.declaring_error_rate();
     let def_rate = field_stats.defending_error_rate();
     let diff = decl_rate - def_rate;
-    let rel_pct = if decl_rate > 0.0 { -diff / decl_rate * 100.0 } else { 0.0 };
+    let rel_pct = if decl_rate > 0.0 {
+        -diff / decl_rate * 100.0
+    } else {
+        0.0
+    };
 
-    println!("{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
+    println!(
+        "{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
         "FIELD (others)",
         field_stats.total_deals(),
         field_stats.declaring_deals,
@@ -2527,7 +2835,8 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
         diff,
         rel_pct
     );
-    println!("{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10}",
+    println!(
+        "{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10}",
         "",
         "",
         "",
@@ -2549,23 +2858,47 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
         // Declaring comparison
         let decl_gap = subj_a.declaring_error_rate() - subj_b.declaring_error_rate();
         println!("\n  DECLARING:");
-        println!("    {:<20}: {:.2}% error rate", subj_a.name, subj_a.declaring_error_rate());
-        println!("    {:<20}: {:.2}% error rate", subj_b.name, subj_b.declaring_error_rate());
-        println!("    Skill gap: {:+.2}% ({} has {} errors declaring)",
+        println!(
+            "    {:<20}: {:.2}% error rate",
+            subj_a.name,
+            subj_a.declaring_error_rate()
+        );
+        println!(
+            "    {:<20}: {:.2}% error rate",
+            subj_b.name,
+            subj_b.declaring_error_rate()
+        );
+        println!(
+            "    Skill gap: {:+.2}% ({} has more errors declaring)",
             decl_gap,
-            if decl_gap > 0.0 { &subj_a.name } else { &subj_b.name },
-            "more"
+            if decl_gap > 0.0 {
+                &subj_a.name
+            } else {
+                &subj_b.name
+            }
         );
 
         // Defending comparison
         let def_gap = subj_a.defending_error_rate() - subj_b.defending_error_rate();
         println!("\n  DEFENDING:");
-        println!("    {:<20}: {:.2}% error rate", subj_a.name, subj_a.defending_error_rate());
-        println!("    {:<20}: {:.2}% error rate", subj_b.name, subj_b.defending_error_rate());
-        println!("    Skill gap: {:+.2}% ({} has {} errors defending)",
+        println!(
+            "    {:<20}: {:.2}% error rate",
+            subj_a.name,
+            subj_a.defending_error_rate()
+        );
+        println!(
+            "    {:<20}: {:.2}% error rate",
+            subj_b.name,
+            subj_b.defending_error_rate()
+        );
+        println!(
+            "    Skill gap: {:+.2}% ({} has more errors defending)",
             def_gap,
-            if def_gap > 0.0 { &subj_a.name } else { &subj_b.name },
-            "more"
+            if def_gap > 0.0 {
+                &subj_a.name
+            } else {
+                &subj_b.name
+            }
         );
 
         // Convergence analysis
@@ -2576,11 +2909,16 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
                 convergence, decl_gap.abs(), def_gap.abs());
             println!("    This pattern (partners performing more similarly on defense) can indicate hand sharing.");
         } else if convergence < -1.0 {
-            println!("    Skill gap WIDENS by {:.2}% on defense - consistent with honest play",
-                -convergence);
+            println!(
+                "    Skill gap WIDENS by {:.2}% on defense - consistent with honest play",
+                -convergence
+            );
         } else {
-            println!("    Skill gap is similar in both roles ({:.2}% declaring, {:.2}% defending)",
-                decl_gap.abs(), def_gap.abs());
+            println!(
+                "    Skill gap is similar in both roles ({:.2}% declaring, {:.2}% defending)",
+                decl_gap.abs(),
+                def_gap.abs()
+            );
         }
 
         // Statistical Test Section
@@ -2635,8 +2973,12 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
     println!("    - Def-Decl pattern significantly different from FIELD");
     println!("    - Partners' skill gap narrowing on defense vs declaring");
     println!("\n  STATISTICAL MEASURES:");
-    println!("    Z-score: How many standard deviations a player's pattern differs from the FIELD.");
-    println!("             Z < -1.96 means suspiciously better defense (only 2.5% chance if honest).");
+    println!(
+        "    Z-score: How many standard deviations a player's pattern differs from the FIELD."
+    );
+    println!(
+        "             Z < -1.96 means suspiciously better defense (only 2.5% chance if honest)."
+    );
     println!("             Z > +1.96 means normal pattern (defense harder than declaring).");
     println!("    P-value: Probability of seeing this result if the player were honest.");
     println!("             P < 0.05 = significant (less than 5% chance if honest).");
@@ -2645,7 +2987,8 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
     // Suspicious Players Table: Def-Decl > 0.05% (defense better than declaring) and p < 0.20
     // Require minimum 50 deals for statistical reliability
     const MIN_DEALS_FOR_SUSPICIOUS: u64 = 50;
-    let mut suspicious: Vec<_> = players.iter()
+    let mut suspicious: Vec<_> = players
+        .iter()
         .filter_map(|p| {
             // Skip players with insufficient data
             if p.total_deals() < MIN_DEALS_FOR_SUSPICIOUS {
@@ -2676,7 +3019,8 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
 
     if !suspicious.is_empty() {
         // Build set of suspicious player names for partnership lookup
-        let suspicious_names: HashSet<String> = suspicious.iter()
+        let suspicious_names: HashSet<String> = suspicious
+            .iter()
             .map(|(p, _, _, _)| p.name.clone())
             .collect();
 
@@ -2701,9 +3045,12 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
                     continue;
                 };
 
-                if suspicious_names.contains(&partner_name) && !partner_annotations.contains_key(&partner_name) {
+                if suspicious_names.contains(&partner_name)
+                    && !partner_annotations.contains_key(&partner_name)
+                {
                     // Check if this partnership is >= 60% of the smaller player's deals
-                    let partner_stats = suspicious.iter()
+                    let partner_stats = suspicious
+                        .iter()
                         .find(|(p, _, _, _)| p.name == partner_name)
                         .map(|(p, _, _, _)| p);
 
@@ -2711,10 +3058,10 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
                         let min_deals = player.total_deals().min(partner.total_deals());
                         let partnership_pct = count as f64 / min_deals as f64;
 
-                        if partnership_pct >= 0.60 {
-                            if best_partner.is_none() || count > best_partner.as_ref().unwrap().1 {
-                                best_partner = Some((partner_name.clone(), count));
-                            }
+                        if partnership_pct >= 0.60
+                            && (best_partner.is_none() || count > best_partner.as_ref().unwrap().1)
+                        {
+                            best_partner = Some((partner_name.clone(), count));
                         }
                     }
                 }
@@ -2728,9 +3075,23 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
             }
         }
 
-        println!("\n{:=^124}", " Suspicious Patterns (Def better than Decl, p < 20%) ");
-        println!("\n{:<24} {:>8} {:>6} {:>6} {:>10} {:>10} {:>12} {:>8} {:>10} {:>10}",
-            "Player", "Deals", "Decl", "Def", "Decl Err%", "Def Err%", "Def-Decl", "Rel%", "Z-score", "P-value");
+        println!(
+            "\n{:=^124}",
+            " Suspicious Patterns (Def better than Decl, p < 20%) "
+        );
+        println!(
+            "\n{:<24} {:>8} {:>6} {:>6} {:>10} {:>10} {:>12} {:>8} {:>10} {:>10}",
+            "Player",
+            "Deals",
+            "Decl",
+            "Def",
+            "Decl Err%",
+            "Def Err%",
+            "Def-Decl",
+            "Rel%",
+            "Z-score",
+            "P-value"
+        );
         println!("{:-<128}", "");
 
         for (player, def_minus_decl, z, p_val) in &suspicious {
@@ -2744,9 +3105,14 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
             // Relative percent: how much better defense is vs declaring
             // Negative def_minus_decl means defense is better, so rel_pct is positive improvement
             let decl_rate = player.declaring_error_rate();
-            let rel_pct = if decl_rate > 0.0 { -def_minus_decl / decl_rate * 100.0 } else { 0.0 };
+            let rel_pct = if decl_rate > 0.0 {
+                -def_minus_decl / decl_rate * 100.0
+            } else {
+                0.0
+            };
 
-            println!("{:<24} {:>8} {:>6} {:>6} {:>9.2}% {:>9.2}% {:>+11.2}% {:>+7.1}% {:>10.2} {:>9.4}",
+            println!(
+                "{:<24} {:>8} {:>6} {:>6} {:>9.2}% {:>9.2}% {:>+11.2}% {:>+7.1}% {:>10.2} {:>9.4}",
                 display_name,
                 player.total_deals(),
                 player.declaring_deals,
@@ -2766,7 +3132,8 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
             println!("      Numbers in parentheses indicate players who are partners (60%+ of deals together).");
         }
         // Count players with vs without partner annotations
-        let partnered_count = suspicious.iter()
+        let partnered_count = suspicious
+            .iter()
             .filter(|(p, _, _, _)| partner_annotations.contains_key(&p.name))
             .count();
         let non_partnered_count = suspicious.len() - partnered_count;
@@ -2780,18 +3147,26 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
 
     // Write detailed CSV if requested
     if let Some(output_path) = output {
-        let mut writer = Writer::from_path(output_path)
-            .context("Failed to create output CSV")?;
+        let mut writer = Writer::from_path(output_path).context("Failed to create output CSV")?;
 
-        writer.write_record(&[
-            "Player", "Total_Deals", "Decl_Deals", "Def_Deals",
-            "Decl_Plays", "Decl_Errors", "Decl_Err_Pct", "Decl_CI",
-            "Def_Plays", "Def_Errors", "Def_Err_Pct", "Def_CI",
-            "Diff_Pct"
+        writer.write_record([
+            "Player",
+            "Total_Deals",
+            "Decl_Deals",
+            "Def_Deals",
+            "Decl_Plays",
+            "Decl_Errors",
+            "Decl_Err_Pct",
+            "Decl_CI",
+            "Def_Plays",
+            "Def_Errors",
+            "Def_Err_Pct",
+            "Def_CI",
+            "Diff_Pct",
         ])?;
 
         for player in &players {
-            writer.write_record(&[
+            writer.write_record([
                 &player.name,
                 &player.total_deals().to_string(),
                 &player.declaring_deals.to_string(),
@@ -2804,12 +3179,15 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
                 &player.defending_errors.to_string(),
                 &format!("{:.4}", player.defending_error_rate()),
                 &format!("{:.4}", player.defending_ci()),
-                &format!("{:.4}", player.declaring_error_rate() - player.defending_error_rate()),
+                &format!(
+                    "{:.4}",
+                    player.declaring_error_rate() - player.defending_error_rate()
+                ),
             ])?;
         }
 
         // Add Field row
-        writer.write_record(&[
+        writer.write_record([
             "FIELD",
             &field_stats.total_deals().to_string(),
             &field_stats.declaring_deals.to_string(),
@@ -2822,7 +3200,10 @@ fn compute_stats(input: &PathBuf, top_n: usize, output: Option<&PathBuf>) -> Res
             &field_stats.defending_errors.to_string(),
             &format!("{:.4}", field_stats.defending_error_rate()),
             &format!("{:.4}", field_stats.defending_ci()),
-            &format!("{:.4}", field_stats.declaring_error_rate() - field_stats.defending_error_rate()),
+            &format!(
+                "{:.4}",
+                field_stats.declaring_error_rate() - field_stats.defending_error_rate()
+            ),
         ])?;
 
         writer.flush()?;

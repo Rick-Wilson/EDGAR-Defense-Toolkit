@@ -10,11 +10,11 @@
 
 use anyhow::{Context, Result};
 use bridge_parsers::lin::parse_lin_from_url;
-use bridge_parsers::{Card, Direction, Rank, Suit};
 use bridge_parsers::tinyurl::UrlResolver;
+use bridge_parsers::{Card, Direction, Rank, Suit};
 use bridge_solver::cards::{card_of, suit_of};
 use bridge_solver::{CutoffCache, Hands, PartialTrick, PatternCache, Solver};
-use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NOTRUMP, NORTH, SOUTH, SPADE, WEST};
+use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, NOTRUMP, SOUTH, SPADE, WEST};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         None => {
             eprintln!("Usage: {} [--mid-trick] <tinyurl>", args[0]);
             eprintln!("Example: {} http://tinyurl.com/27g7hbuc", args[0]);
-            eprintln!("");
+            eprintln!();
             eprintln!("Options:");
             eprintln!("  --mid-trick    Compute DD after every card (slower, may differ from BBO)");
             eprintln!("                 Default: compute DD at trick boundaries only");
@@ -115,7 +115,13 @@ fn main() -> Result<()> {
     let mut pattern_cache = PatternCache::new(16);
 
     // Initial DD
-    let initial_ns = solve_position(&hands, trump, initial_leader, &mut cutoff_cache, &mut pattern_cache);
+    let initial_ns = solve_position(
+        &hands,
+        trump,
+        initial_leader,
+        &mut cutoff_cache,
+        &mut pattern_cache,
+    );
     let initial_declarer = if declarer_is_ns {
         initial_ns
     } else {
@@ -156,14 +162,26 @@ fn main() -> Result<()> {
 
                 // Compute DD BEFORE this card is played
                 let dd_before = if partial_trick.is_empty() {
-                    let ns = solve_position(&current_hands, trump, current_leader, &mut cutoff_cache, &mut pattern_cache);
+                    let ns = solve_position(
+                        &current_hands,
+                        trump,
+                        current_leader,
+                        &mut cutoff_cache,
+                        &mut pattern_cache,
+                    );
                     if declarer_is_ns {
                         declarer_tricks_won + ns
                     } else {
                         declarer_tricks_won + (current_hands.num_tricks() as u8).saturating_sub(ns)
                     }
                 } else {
-                    let (ns, remaining) = solve_mid_trick(&current_hands, trump, &partial_trick, &mut cutoff_cache, &mut pattern_cache);
+                    let (ns, remaining) = solve_mid_trick(
+                        &current_hands,
+                        trump,
+                        &partial_trick,
+                        &mut cutoff_cache,
+                        &mut pattern_cache,
+                    );
                     if declarer_is_ns {
                         declarer_tricks_won + ns
                     } else {
@@ -189,7 +207,13 @@ fn main() -> Result<()> {
                     if current_hands.num_tricks() == 0 {
                         declarer_tricks_won + tricks_from_this
                     } else {
-                        let ns = solve_position(&current_hands, trump, winner, &mut cutoff_cache, &mut pattern_cache);
+                        let ns = solve_position(
+                            &current_hands,
+                            trump,
+                            winner,
+                            &mut cutoff_cache,
+                            &mut pattern_cache,
+                        );
                         if declarer_is_ns {
                             declarer_tricks_won + tricks_from_this + ns
                         } else {
@@ -198,7 +222,13 @@ fn main() -> Result<()> {
                         }
                     }
                 } else {
-                    let (ns, remaining) = solve_mid_trick(&current_hands, trump, &partial_trick, &mut cutoff_cache, &mut pattern_cache);
+                    let (ns, remaining) = solve_mid_trick(
+                        &current_hands,
+                        trump,
+                        &partial_trick,
+                        &mut cutoff_cache,
+                        &mut pattern_cache,
+                    );
                     if declarer_is_ns {
                         declarer_tricks_won + ns
                     } else {
@@ -214,21 +244,37 @@ fn main() -> Result<()> {
                 };
 
                 let cost = if player_is_declarer_side {
-                    if dd_after < dd_before { dd_before - dd_after } else { 0 }
+                    dd_before.saturating_sub(dd_after)
                 } else {
-                    if dd_after > dd_before { dd_after - dd_before } else { 0 }
+                    dd_after.saturating_sub(dd_before)
                 };
 
                 let card_str = format!("{}{}", card.suit.to_char(), card.rank.to_char());
                 let position = match card_idx {
-                    0 => "Lead", 1 => "2nd", 2 => "3rd", 3 => "4th", _ => "?",
+                    0 => "Lead",
+                    1 => "2nd",
+                    2 => "3rd",
+                    3 => "4th",
+                    _ => "?",
                 };
 
                 println!(
                     "{:^6} | {:^4} | {:^6} | {:^6} | {:^10} | {:^10} | {:^6}",
-                    if card_idx == 0 { format!("{}", trick_num + 1) } else { "".to_string() },
-                    position, seat_name(seat), card_str, dd_before, dd_after,
-                    if cost > 0 { format!("{}", cost) } else { "-".to_string() }
+                    if card_idx == 0 {
+                        format!("{}", trick_num + 1)
+                    } else {
+                        "".to_string()
+                    },
+                    position,
+                    seat_name(seat),
+                    card_str,
+                    dd_before,
+                    dd_after,
+                    if cost > 0 {
+                        format!("{}", cost)
+                    } else {
+                        "-".to_string()
+                    }
                 );
 
                 seat = (seat + 1) % 4;
@@ -242,7 +288,9 @@ fn main() -> Result<()> {
                 } else {
                     winner == EAST || winner == WEST
                 };
-                if declarer_won { declarer_tricks_won += 1; }
+                if declarer_won {
+                    declarer_tricks_won += 1;
+                }
                 current_leader = winner;
                 println!("{}", "-".repeat(72));
             }
@@ -255,7 +303,13 @@ fn main() -> Result<()> {
 
             // DD at start of trick (before any card played)
             let dd_start = {
-                let ns = solve_position(&current_hands, trump, current_leader, &mut cutoff_cache, &mut pattern_cache);
+                let ns = solve_position(
+                    &current_hands,
+                    trump,
+                    current_leader,
+                    &mut cutoff_cache,
+                    &mut pattern_cache,
+                );
                 if declarer_is_ns {
                     declarer_tricks_won + ns
                 } else {
@@ -271,14 +325,22 @@ fn main() -> Result<()> {
 
                 let card_str = format!("{}{}", card.suit.to_char(), card.rank.to_char());
                 let position = match card_idx {
-                    0 => "Lead", 1 => "2nd", 2 => "3rd", 3 => "4th", _ => "?",
+                    0 => "Lead",
+                    1 => "2nd",
+                    2 => "3rd",
+                    3 => "4th",
+                    _ => "?",
                 };
 
                 // Only show DD values for first and last card of trick
                 if card_idx == 0 {
                     println!(
                         "{:^6} | {:^4} | {:^6} | {:^6} | {:^10} |            |       ",
-                        trick_num + 1, position, seat_name(seat), card_str, dd_start
+                        trick_num + 1,
+                        position,
+                        seat_name(seat),
+                        card_str,
+                        dd_start
                     );
                 } else if card_idx == 3 {
                     // Compute DD at end of trick
@@ -293,7 +355,13 @@ fn main() -> Result<()> {
                     let dd_end = if current_hands.num_tricks() == 0 {
                         declarer_tricks_won + tricks_from_this
                     } else {
-                        let ns = solve_position(&current_hands, trump, winner, &mut cutoff_cache, &mut pattern_cache);
+                        let ns = solve_position(
+                            &current_hands,
+                            trump,
+                            winner,
+                            &mut cutoff_cache,
+                            &mut pattern_cache,
+                        );
                         if declarer_is_ns {
                             declarer_tricks_won + tricks_from_this + ns
                         } else {
@@ -303,25 +371,34 @@ fn main() -> Result<()> {
                     };
 
                     // Cost = any change in DD during this trick
-                    let cost = if dd_end < dd_start {
-                        dd_start - dd_end
-                    } else {
-                        0
-                    };
+                    let cost = dd_start.saturating_sub(dd_end);
 
                     println!(
                         "{:^6} | {:^4} | {:^6} | {:^6} |            | {:^10} | {:^6}",
-                        "", position, seat_name(seat), card_str, dd_end,
-                        if cost > 0 { format!("{}", cost) } else { "-".to_string() }
+                        "",
+                        position,
+                        seat_name(seat),
+                        card_str,
+                        dd_end,
+                        if cost > 0 {
+                            format!("{}", cost)
+                        } else {
+                            "-".to_string()
+                        }
                     );
 
                     // Update state
-                    if declarer_won { declarer_tricks_won += 1; }
+                    if declarer_won {
+                        declarer_tricks_won += 1;
+                    }
                     current_leader = winner;
                 } else {
                     println!(
                         "{:^6} | {:^4} | {:^6} | {:^6} |            |            |       ",
-                        "", position, seat_name(seat), card_str
+                        "",
+                        position,
+                        seat_name(seat),
+                        card_str
                     );
                 }
 
@@ -427,7 +504,7 @@ fn extract_contract(lin_data: &bridge_parsers::lin::LinData) -> String {
     if redoubled {
         contract.push_str("XX");
     } else if doubled {
-        contract.push_str("X");
+        contract.push('X');
     }
     contract
 }
@@ -512,8 +589,8 @@ fn parse_card_str(s: &str) -> Result<Card> {
         _ => return Err(anyhow::anyhow!("Invalid suit: {}", suit_char)),
     };
 
-    let rank = Rank::from_char(rank_char)
-        .ok_or_else(|| anyhow::anyhow!("Invalid rank: {}", rank_char))?;
+    let rank =
+        Rank::from_char(rank_char).ok_or_else(|| anyhow::anyhow!("Invalid rank: {}", rank_char))?;
 
     Ok(Card::new(suit, rank))
 }

@@ -6,8 +6,10 @@
 //! The test exercises the main dd_analysis library module, ensuring that
 //! the same code paths are tested as would be used in production.
 
-use edgar_defense_toolkit::dd_analysis::{analyze_board, aggregate_errors_by_player, DdAnalysisConfig};
 use bridge_parsers::lin::parse_lin_file;
+use edgar_defense_toolkit::dd_analysis::{
+    aggregate_errors_by_player, analyze_board, DdAnalysisConfig,
+};
 use std::collections::HashMap;
 use std::fs;
 
@@ -115,7 +117,7 @@ fn test_dd_analysis_trick_boundary() {
                 for (player, count) in player_errors {
                     computed_errors
                         .entry(player)
-                        .or_insert_with(HashMap::new)
+                        .or_default()
                         .entry(board_num)
                         .and_modify(|e| *e += count)
                         .or_insert(count);
@@ -127,7 +129,7 @@ fn test_dd_analysis_trick_boundary() {
     // Compare with reference
     let mut mismatches = Vec::new();
     let mut exact_matches = 0;
-    let mut close_matches = 0; // Off by 1
+    let mut _close_matches = 0; // Off by 1
 
     for (player, ref_boards) in &reference {
         let computed = computed_errors.get(player).cloned().unwrap_or_default();
@@ -138,7 +140,7 @@ fn test_dd_analysis_trick_boundary() {
             if actual_count == *expected_count {
                 exact_matches += 1;
             } else if (actual_count as i16 - *expected_count as i16).abs() == 1 {
-                close_matches += 1;
+                _close_matches += 1;
                 mismatches.push(format!(
                     "{} Board {}: expected {} errors, got {} (off by 1)",
                     player, board_num, expected_count, actual_count
@@ -238,7 +240,7 @@ fn test_dd_analysis_mid_trick() {
                 for (player, count) in player_errors {
                     computed_errors
                         .entry(player)
-                        .or_insert_with(HashMap::new)
+                        .or_default()
                         .entry(board_num)
                         .and_modify(|e| *e += count)
                         .or_insert(count);
@@ -324,7 +326,9 @@ fn test_dd_analysis_mid_trick() {
     println!("\n=== DD Analysis Test Complete (Mid-Trick Mode) ===");
     println!(
         "Results: {} exact, {} close, {} other differences",
-        exact_matches, close_matches, mismatches.len() - close_matches
+        exact_matches,
+        close_matches,
+        mismatches.len() - close_matches
     );
 
     // Don't fail the test - just report results for comparison
@@ -344,7 +348,7 @@ fn test_dd_analysis_error_details() {
     // This demonstrates the methodology difference
     let board_5 = boards
         .iter()
-        .find(|b| b.board_header.as_ref().map_or(false, |h| h.contains("5")));
+        .find(|b| b.board_header.as_ref().is_some_and(|h| h.contains("5")));
 
     if let Some(board) = board_5 {
         println!("\n=== Board 5 Detailed Analysis ===");
@@ -355,7 +359,10 @@ fn test_dd_analysis_error_details() {
             println!("Contract: {} by {}", result.contract, result.declarer);
             println!("Initial DD: {}", result.initial_dd);
             println!("Final result: {}", result.final_result);
-            println!("\nAll errors found by mid-trick analysis ({} total):", result.errors.len());
+            println!(
+                "\nAll errors found by mid-trick analysis ({} total):",
+                result.errors.len()
+            );
 
             // Group errors by player
             let mut errors_by_player: HashMap<String, Vec<_>> = HashMap::new();
@@ -383,16 +390,20 @@ fn test_dd_analysis_error_details() {
             // Show the reference expectation
             println!("\n=== Reference vs Our Analysis ===");
             println!("Reference (web plugin): usvi has 2 errors on Board 5");
-            println!("Our mid-trick analysis: usvi has {} errors on Board 5",
-                errors_by_player.get("usvi").map(|e| e.len()).unwrap_or(0));
+            println!(
+                "Our mid-trick analysis: usvi has {} errors on Board 5",
+                errors_by_player.get("usvi").map(|e| e.len()).unwrap_or(0)
+            );
 
             // Count unique tricks with errors per player
             if let Some(usvi_errors) = errors_by_player.get("usvi") {
                 let unique_tricks: std::collections::HashSet<_> =
                     usvi_errors.iter().map(|e| e.trick_num).collect();
-                println!("usvi errors span {} different tricks: {:?}",
+                println!(
+                    "usvi errors span {} different tricks: {:?}",
                     unique_tricks.len(),
-                    unique_tricks.iter().collect::<Vec<_>>());
+                    unique_tricks.iter().collect::<Vec<_>>()
+                );
             }
 
             println!("\nKey insight from web plugin:");
@@ -416,7 +427,7 @@ fn test_trick_boundary_debug() {
     // But trick-boundary mode finds 0 for both
     let board_3 = boards
         .iter()
-        .find(|b| b.board_header.as_ref().map_or(false, |h| h.ends_with(" 3")));
+        .find(|b| b.board_header.as_ref().is_some_and(|h| h.ends_with(" 3")));
 
     if let Some(board) = board_3 {
         println!("\n=== Board 3 Analysis ===");
@@ -434,8 +445,10 @@ fn test_trick_boundary_debug() {
             for err in &result.errors {
                 println!(
                     "  - {} T{}: {}{} cost={}",
-                    err.player, err.trick_num,
-                    err.card.suit.to_char(), err.card.rank.to_char(),
+                    err.player,
+                    err.trick_num,
+                    err.card.suit.to_char(),
+                    err.card.rank.to_char(),
                     err.cost
                 );
             }
@@ -448,8 +461,11 @@ fn test_trick_boundary_debug() {
             for err in &result.errors {
                 println!(
                     "  - {} T{} pos{}: {}{} cost={}",
-                    err.player, err.trick_num, err.card_position,
-                    err.card.suit.to_char(), err.card.rank.to_char(),
+                    err.player,
+                    err.trick_num,
+                    err.card_position,
+                    err.card.suit.to_char(),
+                    err.card.rank.to_char(),
                     err.cost
                 );
             }
