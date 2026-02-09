@@ -35,19 +35,7 @@ enum TabId {
     Package,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileKind {
-    Input,
-    Output,
-}
-
-/// Results of scanning a case folder for EDGAR report files.
-#[derive(Debug, Clone, Default)]
-struct CaseFiles {
-    csv_file: Option<PathBuf>,
-    concise_file: Option<PathBuf>,
-    hotspot_file: Option<PathBuf>,
-}
+use edgar_defense_toolkit::pipeline::CaseFiles;
 
 struct App {
     active_tab: TabId,
@@ -84,7 +72,6 @@ struct App {
 
     // Stats tab
     stats_input: String,
-    stats_output: String,
     stats_top_n: String,
     stats_result: String,
 
@@ -117,55 +104,100 @@ impl App {
     }
 
     fn new() -> (Self, Task<Message>) {
-        let (deal_limit_enabled, deal_limit_count) = load_config();
-        (
-            App {
-                active_tab: TabId::Welcome,
-                case_folder: String::new(),
-                case_files: CaseFiles::default(),
-                case_usernames: Vec::new(),
-                deal_limit_enabled,
-                deal_limit_count,
-                fetch_input: String::new(),
-                fetch_output: String::new(),
-                fetch_delay: "20".to_string(),
-                fetch_batch_size: "100".to_string(),
-                fetch_batch_delay: "500".to_string(),
-                fetch_resume: false,
-                fetch_advanced_open: false,
-                fetch_row_count: None,
-                anon_input: String::new(),
-                anon_output: String::new(),
-                anon_map: String::new(),
-                analyze_input: String::new(),
-                analyze_output: String::new(),
-                analyze_threads: String::new(),
-                analyze_checkpoint: "100".to_string(),
-                analyze_resume: false,
-                analyze_advanced_open: false,
-                stats_input: String::new(),
-                stats_output: String::new(),
-                stats_top_n: "10".to_string(),
-                stats_result: String::new(),
-                display_input: String::new(),
-                display_row: "1".to_string(),
-                display_result: String::new(),
-                package_output: String::new(),
-                package_status: String::new(),
-                fetch_cancel: Arc::new(AtomicBool::new(false)),
-                is_running: false,
-                running_tab: None,
-                progress: 0.0,
-                progress_total: 0,
-                progress_completed: 0,
-                progress_errors: 0,
-                progress_skipped: 0,
-                fetch_start_time: None,
-                status_text: String::new(),
-                log_lines: Vec::new(),
-            },
-            Task::none(),
-        )
+        let cfg = load_config();
+        let saved_folder = cfg.case_folder.clone();
+        let mut app = App {
+            active_tab: TabId::Welcome,
+            case_folder: String::new(),
+            case_files: CaseFiles::default(),
+            case_usernames: Vec::new(),
+            deal_limit_enabled: cfg.deal_limit_enabled,
+            deal_limit_count: cfg.deal_limit_count,
+            fetch_input: String::new(),
+            fetch_output: String::new(),
+            fetch_delay: "20".to_string(),
+            fetch_batch_size: "100".to_string(),
+            fetch_batch_delay: "500".to_string(),
+            fetch_resume: false,
+            fetch_advanced_open: false,
+            fetch_row_count: None,
+            anon_input: String::new(),
+            anon_output: String::new(),
+            anon_map: String::new(),
+            analyze_input: String::new(),
+            analyze_output: String::new(),
+            analyze_threads: String::new(),
+            analyze_checkpoint: "100".to_string(),
+            analyze_resume: false,
+            analyze_advanced_open: false,
+            stats_input: String::new(),
+            stats_top_n: "10".to_string(),
+            stats_result: String::new(),
+            display_input: String::new(),
+            display_row: "1".to_string(),
+            display_result: String::new(),
+            package_output: String::new(),
+            package_status: String::new(),
+            fetch_cancel: Arc::new(AtomicBool::new(false)),
+            is_running: false,
+            running_tab: None,
+            progress: 0.0,
+            progress_total: 0,
+            progress_completed: 0,
+            progress_errors: 0,
+            progress_skipped: 0,
+            fetch_start_time: None,
+            status_text: String::new(),
+            log_lines: Vec::new(),
+        };
+
+        // Restore last case folder from config
+        if !saved_folder.is_empty() {
+            let p = PathBuf::from(&saved_folder);
+            if p.is_dir() {
+                app.case_folder = saved_folder;
+                app.case_files = pipeline::scan_case_folder(&p);
+
+                app.case_usernames = if let Some(concise) = &app.case_files.concise_file {
+                    pipeline::parse_concise_usernames(concise)
+                } else {
+                    Vec::new()
+                };
+
+                if let Some(csv) = &app.case_files.csv_file {
+                    app.fetch_input = csv.display().to_string();
+                    app.update_fetch_row_count();
+                    app.update_fetch_output();
+                    app.anon_input = app.fetch_output.clone();
+                    app.update_anon_output();
+                    app.analyze_input = app.anon_output.clone();
+                    app.update_analyze_output();
+                }
+
+                let default_names = ["Bob", "Sally"];
+                let map_parts: Vec<String> = app
+                    .case_usernames
+                    .iter()
+                    .zip(default_names.iter())
+                    .map(|(user, alias)| format!("{}={}", user, alias))
+                    .collect();
+                app.anon_map = map_parts.join(",");
+
+                let subject = app
+                    .case_files
+                    .concise_file
+                    .as_deref()
+                    .and_then(pipeline::extract_concise_subject)
+                    .unwrap_or_else(|| "Report".to_string());
+                app.package_output = format!(
+                    "{}/EDGAR Defense/EDGAR Defense {}.xlsx",
+                    p.display(),
+                    subject
+                );
+            }
+        }
+
+        (app, Task::none())
     }
 
     /// Shorten an absolute path to show from the case folder's parent on down.
@@ -179,15 +211,6 @@ impl App {
         } else {
             full.to_string()
         }
-    }
-
-    /// Reconstruct a full path from a shortened display path.
-    fn expand_path(&self, short: &str) -> String {
-        let parent = Path::new(&self.case_folder)
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        parent.join(short).display().to_string()
     }
 
     /// Get the current deal limit if enabled and valid.
@@ -266,10 +289,6 @@ enum Message {
     // Tab navigation
     TabSelected(TabId),
 
-    // File dialogs
-    BrowseFile(TabId, FileKind),
-    FileSelected(TabId, FileKind, Option<PathBuf>),
-
     // Welcome / case folder
     BrowseFolder,
     FolderSelected(Option<PathBuf>),
@@ -277,16 +296,11 @@ enum Message {
     DealLimitChanged(String),
 
     // Package (Welcome tab)
-    PackageOutputChanged(String),
-    BrowsePackageOutput,
-    PackageOutputSelected(Option<PathBuf>),
     PackageStart,
     PackageCompleted(Result<String, String>),
     OpenPackage,
 
     // Fetch tab
-    FetchInputChanged(String),
-    FetchOutputChanged(String),
     FetchDelayChanged(String),
     FetchBatchSizeChanged(String),
     FetchBatchDelayChanged(String),
@@ -296,14 +310,11 @@ enum Message {
     FetchCancel,
 
     // Anonymize tab
-    AnonInputChanged(String),
     AnonMapChanged(String),
     AnonStart,
-    AnonCompleted(Result<String, String>),
+    AnonCancel,
 
     // Analyze tab
-    AnalyzeInputChanged(String),
-    AnalyzeOutputChanged(String),
     AnalyzeThreadsChanged(String),
     AnalyzeCheckpointChanged(String),
     AnalyzeResumeToggled(bool),
@@ -312,14 +323,11 @@ enum Message {
     AnalyzeCancel,
 
     // Stats tab
-    StatsInputChanged(String),
-    StatsOutputChanged(String),
     StatsTopNChanged(String),
     StatsRun,
     StatsCompleted(Result<String, String>),
 
     // Display Hand tab
-    DisplayInputChanged(String),
     DisplayRowChanged(String),
     DisplayShow,
     DisplayCompleted(Result<String, String>),
@@ -330,6 +338,7 @@ enum Message {
         total: usize,
         errors: usize,
         skipped: usize,
+        phase: String,
     },
     TaskFinished(Result<String, String>),
 }
@@ -362,7 +371,12 @@ impl App {
             Message::FolderSelected(path) => {
                 if let Some(p) = path {
                     self.case_folder = p.display().to_string();
-                    self.case_files = scan_case_folder(&p);
+                    save_config(
+                        self.deal_limit_enabled,
+                        &self.deal_limit_count,
+                        &self.case_folder,
+                    );
+                    self.case_files = pipeline::scan_case_folder(&p);
 
                     // Create EDGAR Defense subfolder
                     let edgar_dir = p.join("EDGAR Defense");
@@ -370,7 +384,7 @@ impl App {
 
                     // Parse subject usernames from concise report
                     self.case_usernames = if let Some(concise) = &self.case_files.concise_file {
-                        parse_concise_usernames(concise)
+                        pipeline::parse_concise_usernames(concise)
                     } else {
                         Vec::new()
                     };
@@ -383,6 +397,9 @@ impl App {
                         // Pre-populate anonymize input from fetch output
                         self.anon_input = self.fetch_output.clone();
                         self.update_anon_output();
+                        // Pre-populate analyze input from anonymize output
+                        self.analyze_input = self.anon_output.clone();
+                        self.update_analyze_output();
                     }
 
                     // Default mappings: first subject = Bob, second = Sally
@@ -400,7 +417,7 @@ impl App {
                         .case_files
                         .concise_file
                         .as_deref()
-                        .and_then(extract_concise_subject)
+                        .and_then(pipeline::extract_concise_subject)
                         .unwrap_or_else(|| "Report".to_string());
                     self.package_output = format!(
                         "{}/EDGAR Defense/EDGAR Defense {}.xlsx",
@@ -412,86 +429,29 @@ impl App {
                 Task::none()
             }
 
-            // -- File dialogs --
-            Message::BrowseFile(tab, kind) => Task::perform(
-                async move {
-                    let dialog = rfd::AsyncFileDialog::new().add_filter("CSV files", &["csv"]);
-
-                    let file = match kind {
-                        FileKind::Output => dialog.save_file().await,
-                        FileKind::Input => dialog.pick_file().await,
-                    };
-
-                    let path = file.map(|f| f.path().to_path_buf());
-                    (tab, kind, path)
-                },
-                |(tab, kind, path)| Message::FileSelected(tab, kind, path),
-            ),
-
-            Message::FileSelected(tab, kind, path) => {
-                if let Some(p) = path {
-                    let path_str = p.display().to_string();
-                    match (tab, kind) {
-                        (TabId::Fetch, FileKind::Input) => {
-                            self.fetch_input = path_str;
-                            self.update_fetch_row_count();
-                            self.update_fetch_output();
-                        }
-                        (TabId::Fetch, FileKind::Output) => self.fetch_output = path_str,
-                        (TabId::Anonymize, FileKind::Input) => {
-                            self.anon_input = path_str;
-                            self.update_anon_output();
-                        }
-                        (TabId::Analyze, FileKind::Input) => {
-                            self.analyze_input = path_str;
-                            self.update_analyze_output();
-                        }
-                        (TabId::Analyze, FileKind::Output) => self.analyze_output = path_str,
-                        (TabId::Stats, FileKind::Input) => self.stats_input = path_str,
-                        (TabId::Stats, FileKind::Output) => self.stats_output = path_str,
-                        (TabId::Display, FileKind::Input) => self.display_input = path_str,
-                        _ => {}
-                    }
-                }
-                Task::none()
-            }
-
             // -- Deal limit --
             Message::DealLimitToggled(v) => {
                 self.deal_limit_enabled = v;
-                save_config(self.deal_limit_enabled, &self.deal_limit_count);
+                save_config(
+                    self.deal_limit_enabled,
+                    &self.deal_limit_count,
+                    &self.case_folder,
+                );
                 self.update_fetch_output();
                 Task::none()
             }
             Message::DealLimitChanged(v) => {
                 self.deal_limit_count = v;
-                save_config(self.deal_limit_enabled, &self.deal_limit_count);
+                save_config(
+                    self.deal_limit_enabled,
+                    &self.deal_limit_count,
+                    &self.case_folder,
+                );
                 self.update_fetch_output();
                 Task::none()
             }
 
             // -- Package --
-            Message::PackageOutputChanged(v) => {
-                self.package_output = self.expand_path(&v);
-                Task::none()
-            }
-            Message::BrowsePackageOutput => Task::perform(
-                async {
-                    let file = rfd::AsyncFileDialog::new()
-                        .add_filter("Excel files", &["xlsx"])
-                        .set_file_name("package.xlsx")
-                        .save_file()
-                        .await;
-                    file.map(|f| f.path().to_path_buf())
-                },
-                Message::PackageOutputSelected,
-            ),
-            Message::PackageOutputSelected(path) => {
-                if let Some(p) = path {
-                    self.package_output = p.display().to_string();
-                }
-                Task::none()
-            }
             Message::PackageStart => {
                 let csv = match &self.case_files.csv_file {
                     Some(p) => p.clone(),
@@ -522,11 +482,51 @@ impl App {
                     deal_limit: self.deal_limit(),
                     cardplay_file,
                 };
+
+                // Check for anon files
+                let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+                let anon_files = pipeline::find_anon_files(&edgar_dir, &self.case_files);
+                let anon_config = anon_files.map(|af| {
+                    let subject = self
+                        .case_files
+                        .concise_file
+                        .as_deref()
+                        .and_then(pipeline::extract_concise_subject)
+                        .unwrap_or_else(|| "Report".to_string());
+                    let anon_output =
+                        edgar_dir.join(format!("EDGAR Defense {} anon.xlsx", subject));
+                    pipeline::PackageConfig {
+                        csv_file: af.csv_file,
+                        hotspot_file: af.hotspot_file,
+                        concise_file: af.concise_file,
+                        output: anon_output,
+                        case_folder: self.case_folder.clone(),
+                        subject_players: self.case_usernames.clone(),
+                        deal_limit: self.deal_limit(),
+                        cardplay_file: None,
+                    }
+                });
+
                 self.is_running = true;
                 self.running_tab = Some(TabId::Package);
                 self.package_status = "Creating workbook...".to_string();
                 Task::perform(
-                    async move { pipeline::package_workbook(&config).map_err(|e| e.to_string()) },
+                    async move {
+                        let mut summary =
+                            pipeline::package_workbook(&config).map_err(|e| e.to_string())?;
+                        if let Some(anon_cfg) = &anon_config {
+                            match pipeline::package_workbook(anon_cfg) {
+                                Ok(s) => {
+                                    summary.push('\n');
+                                    summary.push_str(&s);
+                                }
+                                Err(e) => {
+                                    summary.push_str(&format!("\nAnon workbook error: {}", e));
+                                }
+                            }
+                        }
+                        Ok(summary)
+                    },
                     Message::PackageCompleted,
                 )
             }
@@ -548,16 +548,6 @@ impl App {
             }
 
             // -- Fetch tab --
-            Message::FetchInputChanged(v) => {
-                self.fetch_input = self.expand_path(&v);
-                self.update_fetch_row_count();
-                self.update_fetch_output();
-                Task::none()
-            }
-            Message::FetchOutputChanged(v) => {
-                self.fetch_output = self.expand_path(&v);
-                Task::none()
-            }
             Message::FetchDelayChanged(v) => {
                 self.fetch_delay = v;
                 Task::none()
@@ -595,9 +585,12 @@ impl App {
                 let deal_limit = self.deal_limit();
                 let cancel = self.fetch_cancel.clone();
 
+                let output_path = PathBuf::from(&self.fetch_output);
+                let lookup_output = pipeline::derive_lookup_path(&output_path);
                 let config = pipeline::FetchCardplayConfig {
                     input: PathBuf::from(&input_path),
-                    output: PathBuf::from(&self.fetch_output),
+                    output: output_path,
+                    lookup_output,
                     url_column: "BBO".to_string(),
                     delay_ms: self.fetch_delay.parse().unwrap_or(20),
                     batch_size: self.fetch_batch_size.parse().unwrap_or(100),
@@ -615,11 +608,6 @@ impl App {
             }
 
             // -- Anonymize tab --
-            Message::AnonInputChanged(v) => {
-                self.anon_input = self.expand_path(&v);
-                self.update_anon_output();
-                Task::none()
-            }
             Message::AnonMapChanged(v) => {
                 self.anon_map = v;
                 Task::none()
@@ -634,7 +622,7 @@ impl App {
                     .case_files
                     .concise_file
                     .as_deref()
-                    .and_then(extract_concise_subject)
+                    .and_then(pipeline::extract_concise_subject)
                     .unwrap_or_else(|| "default".to_string());
 
                 let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
@@ -668,38 +656,23 @@ impl App {
                 self.is_running = true;
                 self.running_tab = Some(TabId::Anonymize);
                 self.status_text = "Anonymizing...".to_string();
-                Task::perform(
-                    async move { pipeline::anonymize_all(&config).map_err(|e| e.to_string()) },
-                    Message::AnonCompleted,
-                )
+                self.progress = 0.0;
+                self.progress_completed = 0;
+                self.progress_total = 0;
+                self.progress_errors = 0;
+                self.progress_skipped = 0;
+                self.fetch_cancel.store(false, Ordering::Relaxed);
+
+                let cancel = self.fetch_cancel.clone();
+                Task::run(anonymize_stream(config, cancel), |msg| msg)
             }
-            Message::AnonCompleted(result) => {
-                self.is_running = false;
-                self.running_tab = None;
-                match &result {
-                    Ok(s) => {
-                        self.status_text = s.clone();
-                        // Chain: set analyze input to anon output
-                        self.analyze_input = self.anon_output.clone();
-                        self.update_analyze_output();
-                    }
-                    Err(e) => {
-                        self.status_text = format!("Error: {}", e);
-                    }
-                }
+            Message::AnonCancel => {
+                self.fetch_cancel.store(true, Ordering::Relaxed);
+                self.status_text = "Cancelling...".to_string();
                 Task::none()
             }
 
             // -- Analyze tab --
-            Message::AnalyzeInputChanged(v) => {
-                self.analyze_input = self.expand_path(&v);
-                self.update_analyze_output();
-                Task::none()
-            }
-            Message::AnalyzeOutputChanged(v) => {
-                self.analyze_output = self.expand_path(&v);
-                Task::none()
-            }
             Message::AnalyzeThreadsChanged(v) => {
                 self.analyze_threads = v;
                 Task::none()
@@ -721,53 +694,32 @@ impl App {
                 self.running_tab = Some(TabId::Analyze);
                 self.status_text = "Running DD analysis...".to_string();
                 self.log_lines.clear();
+                self.progress = 0.0;
+                self.progress_completed = 0;
+                self.progress_total = 0;
+                self.progress_errors = 0;
+                self.progress_skipped = 0;
+                self.fetch_start_time = Some(Instant::now());
+                self.fetch_cancel.store(false, Ordering::Relaxed);
 
-                let input_path = self.analyze_input.clone();
-                let output = self.analyze_output.clone();
-                let threads = self.analyze_threads.clone();
-                let checkpoint = self.analyze_checkpoint.clone();
-                let resume = self.analyze_resume;
+                let cancel = self.fetch_cancel.clone();
+                let config = pipeline::AnalyzeDdConfig {
+                    input: PathBuf::from(&self.analyze_input),
+                    output: PathBuf::from(&self.analyze_output),
+                    threads: self.analyze_threads.parse().ok(),
+                    resume: self.analyze_resume,
+                    checkpoint_interval: self.analyze_checkpoint.parse().unwrap_or(100),
+                };
 
-                Task::perform(
-                    async move {
-                        let mut args = vec![
-                            "analyze-dd".to_string(),
-                            "--input".to_string(),
-                            input_path,
-                            "--output".to_string(),
-                            output,
-                        ];
-                        if !threads.is_empty() {
-                            args.push("--threads".to_string());
-                            args.push(threads);
-                        }
-                        args.push("--checkpoint-interval".to_string());
-                        args.push(checkpoint);
-                        if resume {
-                            args.push("--resume".to_string());
-                        }
-
-                        run_bbo_csv(args)
-                    },
-                    Message::TaskFinished,
-                )
+                Task::run(analyze_dd_stream(config, cancel), |msg| msg)
             }
             Message::AnalyzeCancel => {
-                self.is_running = false;
-                self.running_tab = None;
-                self.status_text = "Cancelled.".to_string();
+                self.fetch_cancel.store(true, Ordering::Relaxed);
+                self.status_text = "Cancelling...".to_string();
                 Task::none()
             }
 
             // -- Stats tab --
-            Message::StatsInputChanged(v) => {
-                self.stats_input = self.expand_path(&v);
-                Task::none()
-            }
-            Message::StatsOutputChanged(v) => {
-                self.stats_output = self.expand_path(&v);
-                Task::none()
-            }
             Message::StatsTopNChanged(v) => {
                 self.stats_top_n = v;
                 Task::none()
@@ -794,10 +746,6 @@ impl App {
             }
 
             // -- Display Hand tab --
-            Message::DisplayInputChanged(v) => {
-                self.display_input = self.expand_path(&v);
-                Task::none()
-            }
             Message::DisplayRowChanged(v) => {
                 self.display_row = v;
                 Task::none()
@@ -831,6 +779,7 @@ impl App {
                 total,
                 errors,
                 skipped,
+                phase,
             } => {
                 self.progress_completed = completed;
                 self.progress_total = total;
@@ -841,6 +790,9 @@ impl App {
                 } else {
                     0.0
                 };
+                if !phase.is_empty() {
+                    self.status_text = phase;
+                }
                 Task::none()
             }
             Message::TaskFinished(result) => {
@@ -849,7 +801,7 @@ impl App {
                 let finished_tab = self.running_tab.take();
                 match &result {
                     Ok(s) => {
-                        self.status_text = "Completed successfully.".to_string();
+                        self.status_text = s.clone();
                         for line in s.lines() {
                             self.log_lines.push(line.to_string());
                         }
@@ -865,6 +817,10 @@ impl App {
                         Some(TabId::Fetch) => {
                             self.anon_input = self.fetch_output.clone();
                             self.update_anon_output();
+                        }
+                        Some(TabId::Anonymize) => {
+                            self.analyze_input = self.anon_output.clone();
+                            self.update_analyze_output();
                         }
                         Some(TabId::Analyze) => {
                             self.stats_input = self.analyze_output.clone();
@@ -1073,23 +1029,14 @@ impl App {
 
         let fetch_input_short = self.shorten_path(&self.fetch_input);
         let fetch_output_short = self.shorten_path(&self.fetch_output);
+        let lookup_path = pipeline::derive_lookup_path(&PathBuf::from(&self.fetch_output));
+        let lookup_short = self.shorten_path(&lookup_path.display().to_string());
         let form = column![
-            text("Fetch cardplay data from BBO TinyURLs in a CSV file.").size(14),
+            text("Fetch cardplay data from BBO TinyURLs, and save into a CSV file.").size(14),
             estimate_note,
-            file_picker(
-                "Input CSV:",
-                &fetch_input_short,
-                Message::FetchInputChanged,
-                Message::BrowseFile(TabId::Fetch, FileKind::Input),
-                disabled,
-            ),
-            file_picker(
-                "Output CSV:",
-                &fetch_output_short,
-                Message::FetchOutputChanged,
-                Message::BrowseFile(TabId::Fetch, FileKind::Output),
-                disabled,
-            ),
+            file_display_row("Input CSV:", &fetch_input_short),
+            file_display_row("Lookup CSV:", &lookup_short),
+            file_display_row("Output CSV:", &fetch_output_short),
             checkbox(self.fetch_resume)
                 .label("Resume from previous run")
                 .on_toggle_maybe(if disabled {
@@ -1272,15 +1219,51 @@ impl App {
         let disabled = self.is_running;
         let anon_input_short = self.shorten_path(&self.anon_input);
 
+        let csv_out_short = self.shorten_path(&add_suffix_to_filename(&self.anon_input, "anon"));
+
+        let concise_input_short = self
+            .case_files
+            .concise_file
+            .as_ref()
+            .map(|p| self.shorten_path(&p.to_string_lossy()))
+            .unwrap_or_default();
+        let concise_output_short = self
+            .case_files
+            .concise_file
+            .as_ref()
+            .map(|p| {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("concise");
+                let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+                self.shorten_path(&edgar_dir.join(format!("{stem} anon.txt")).to_string_lossy())
+            })
+            .unwrap_or_default();
+
+        let hotspot_input_short = self
+            .case_files
+            .hotspot_file
+            .as_ref()
+            .map(|p| self.shorten_path(&p.to_string_lossy()))
+            .unwrap_or_default();
+        let hotspot_output_short = self
+            .case_files
+            .hotspot_file
+            .as_ref()
+            .map(|p| {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("hotspot");
+                let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+                self.shorten_path(&edgar_dir.join(format!("{stem} anon.txt")).to_string_lossy())
+            })
+            .unwrap_or_default();
+
         let form = column![
             text("Anonymize player names across all case files.").size(14),
-            file_picker(
-                "Cardplay CSV:",
-                &anon_input_short,
-                Message::AnonInputChanged,
-                Message::BrowseFile(TabId::Anonymize, FileKind::Input),
-                disabled,
-            ),
+            file_display_row("Cardplay CSV:", &anon_input_short),
+            file_display_row("Concise Report:", &concise_input_short),
+            file_display_row("Hotspot Report:", &hotspot_input_short),
+            rule::horizontal(1),
+            file_display_row("Anon CSV:", &csv_out_short),
+            file_display_row("Anon Concise:", &concise_output_short),
+            file_display_row("Anon Hotspot:", &hotspot_output_short),
             row![
                 text("Mappings:").width(130),
                 text_input("player1=Bob,player2=Sally", &self.anon_map)
@@ -1296,104 +1279,40 @@ impl App {
         ]
         .spacing(12);
 
-        // File manifest
-        let mut manifest: Vec<Element<'_, Message>> = Vec::new();
-        manifest.push(text("Files to process:").size(14).into());
-
-        if !self.anon_input.is_empty() {
-            let csv_out_short =
-                self.shorten_path(&add_suffix_to_filename(&self.anon_input, "anon"));
-            manifest.push(
-                text(format!(
-                    "  CSV:       {}  ->  {}",
-                    anon_input_short, csv_out_short
-                ))
-                .size(12)
-                .font(iced::Font::MONOSPACE)
-                .into(),
-            );
-        }
-
-        if let Some(concise) = &self.case_files.concise_file {
-            let concise_name = concise
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("concise");
-            let stem = concise
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("concise");
-            manifest.push(
-                text(format!(
-                    "  Concise:   {}  ->  {} anon.txt",
-                    concise_name, stem
-                ))
-                .size(12)
-                .font(iced::Font::MONOSPACE)
-                .into(),
-            );
+        let buttons = if self.is_running && self.running_tab == Some(TabId::Anonymize) {
+            row![
+                button(text("Cancel")).on_press(Message::AnonCancel),
+                text(&self.status_text),
+            ]
+            .spacing(10)
+            .align_y(Center)
         } else {
-            manifest.push(
-                text("  Concise:   (not found)")
-                    .size(12)
-                    .font(iced::Font::MONOSPACE)
-                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
-                    .into(),
-            );
-        }
+            let mut start = button(text("Anonymize"));
+            if !disabled && !self.anon_input.is_empty() {
+                start = start.on_press(Message::AnonStart);
+            }
+            let mut r = row![start].spacing(10);
+            if !self.status_text.is_empty() {
+                r = r.push(text(&self.status_text).size(13));
+            }
+            r.align_y(Center)
+        };
 
-        if let Some(hotspot) = &self.case_files.hotspot_file {
-            let hotspot_name = hotspot
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("hotspot");
-            let stem = hotspot
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("hotspot");
-            manifest.push(
+        let progress_section = if self.is_running && self.running_tab == Some(TabId::Anonymize) {
+            column![
+                progress_bar(0.0..=1.0, self.progress),
                 text(format!(
-                    "  Hotspot:   {}  ->  {} anon.txt",
-                    hotspot_name, stem
+                    "{}/{}",
+                    self.progress_completed, self.progress_total
                 ))
-                .size(12)
-                .font(iced::Font::MONOSPACE)
-                .into(),
-            );
-        } else {
-            manifest.push(
-                text("  Hotspot:   (not found)")
-                    .size(12)
-                    .font(iced::Font::MONOSPACE)
-                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
-                    .into(),
-            );
-        }
-
-        let manifest_section = column(manifest).spacing(4);
-
-        let mut anon_btn = button(text("Anonymize"));
-        if !disabled && !self.anon_input.is_empty() {
-            anon_btn = anon_btn.on_press(Message::AnonStart);
-        }
-
-        let status = if !self.status_text.is_empty()
-            && (self.running_tab == Some(TabId::Anonymize) || !self.is_running)
-        {
-            column![text(&self.status_text).size(13)]
+                .size(13),
+            ]
+            .spacing(4)
         } else {
             column![]
         };
 
-        column![
-            form,
-            rule::horizontal(1),
-            manifest_section,
-            row![anon_btn],
-            status
-        ]
-        .spacing(12)
-        .into()
+        column![form, buttons, progress_section].spacing(12).into()
     }
 
     // -- Analyze DD tab --
@@ -1404,20 +1323,8 @@ impl App {
         let analyze_output_short = self.shorten_path(&self.analyze_output);
         let form = column![
             text("Run double-dummy analysis on cardplay data.").size(14),
-            file_picker(
-                "Input CSV:",
-                &analyze_input_short,
-                Message::AnalyzeInputChanged,
-                Message::BrowseFile(TabId::Analyze, FileKind::Input),
-                disabled,
-            ),
-            file_picker(
-                "Output CSV:",
-                &analyze_output_short,
-                Message::AnalyzeOutputChanged,
-                Message::BrowseFile(TabId::Analyze, FileKind::Output),
-                disabled,
-            ),
+            file_display_row("Input CSV:", &analyze_input_short),
+            file_display_row("Output CSV:", &analyze_output_short),
             checkbox(self.analyze_resume)
                 .label("Resume from previous run")
                 .on_toggle_maybe(if disabled {
@@ -1482,7 +1389,11 @@ impl App {
             if !disabled {
                 start = start.on_press(Message::AnalyzeStart);
             }
-            row![start].spacing(10)
+            let mut r = row![start].spacing(10);
+            if !self.status_text.is_empty() {
+                r = r.push(text(&self.status_text).size(13));
+            }
+            r.align_y(Center)
         };
 
         let progress_section = if self.is_running && self.running_tab == Some(TabId::Analyze) {
@@ -1515,23 +1426,9 @@ impl App {
         let disabled = self.is_running;
 
         let stats_input_short = self.shorten_path(&self.stats_input);
-        let stats_output_short = self.shorten_path(&self.stats_output);
         let form = column![
             text("Compute DD error statistics by player.").size(14),
-            file_picker(
-                "Input CSV:",
-                &stats_input_short,
-                Message::StatsInputChanged,
-                Message::BrowseFile(TabId::Stats, FileKind::Input),
-                disabled,
-            ),
-            file_picker(
-                "Output CSV (opt):",
-                &stats_output_short,
-                Message::StatsOutputChanged,
-                Message::BrowseFile(TabId::Stats, FileKind::Output),
-                disabled,
-            ),
+            file_display_row("Input CSV:", &stats_input_short),
             row![
                 text("Top N players:").width(130),
                 text_input("10", &self.stats_top_n)
@@ -1580,13 +1477,7 @@ impl App {
         let display_input_short = self.shorten_path(&self.display_input);
         let form = column![
             text("Display a single hand with DD analysis.").size(14),
-            file_picker(
-                "Input CSV:",
-                &display_input_short,
-                Message::DisplayInputChanged,
-                Message::BrowseFile(TabId::Display, FileKind::Input),
-                disabled,
-            ),
+            file_display_row("Input CSV:", &display_input_short),
             row![
                 text("Row #:").width(130),
                 text_input("1", &self.display_row)
@@ -1644,32 +1535,52 @@ impl App {
 
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         items.push(
-            text("Create an Excel workbook combining all case data.")
+            text("Create Excel workbook(s) combining all case data.")
                 .size(14)
                 .into(),
         );
 
-        let display_path = self.shorten_path(&self.package_output);
-        items.push(
-            row![
-                text("Output:").width(80),
-                text_input("Package output path...", &display_path)
-                    .on_input_maybe(if disabled {
-                        None
-                    } else {
-                        Some(Message::PackageOutputChanged)
-                    })
-                    .width(Fill),
-                button(text("Browse").size(13)).on_press_maybe(if disabled {
-                    None
-                } else {
-                    Some(Message::BrowsePackageOutput)
-                }),
-            ]
-            .spacing(10)
-            .align_y(Center)
-            .into(),
+        // File manifest showing what will be created
+        let mut manifest: Vec<Element<'_, Message>> = Vec::new();
+        manifest.push(text("Files to create:").size(14).into());
+
+        let output_name = Path::new(&self.package_output)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(unknown)");
+        manifest.push(
+            text(format!("  {}", output_name))
+                .size(12)
+                .font(iced::Font::MONOSPACE)
+                .into(),
         );
+
+        let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+        let has_anon = pipeline::find_anon_files(&edgar_dir, &self.case_files).is_some();
+        if has_anon {
+            let subject = self
+                .case_files
+                .concise_file
+                .as_deref()
+                .and_then(pipeline::extract_concise_subject)
+                .unwrap_or_else(|| "Report".to_string());
+            manifest.push(
+                text(format!("  EDGAR Defense {} anon.xlsx", subject))
+                    .size(12)
+                    .font(iced::Font::MONOSPACE)
+                    .into(),
+            );
+        } else {
+            manifest.push(
+                text("  (anon files not found)")
+                    .size(12)
+                    .font(iced::Font::MONOSPACE)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                    .into(),
+            );
+        }
+
+        items.push(column(manifest).spacing(4).into());
 
         let mut pkg_btn = button(text("Create Workbook"));
         if !disabled && !self.package_output.is_empty() {
@@ -1689,113 +1600,6 @@ impl App {
         }
 
         column(items).spacing(10).into()
-    }
-}
-
-// ============================================================================
-// Case folder scanning
-// ============================================================================
-
-/// Recursively scan a folder for EDGAR case files (CSV, Concise report, Hotspot report).
-fn scan_case_folder(folder: &Path) -> CaseFiles {
-    let mut result = CaseFiles::default();
-    scan_dir_recursive(folder, &mut result);
-    result
-}
-
-/// Recursive directory walker for case file detection.
-fn scan_dir_recursive(dir: &Path, result: &mut CaseFiles) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Skip EDGAR Defense output folder to avoid picking up generated files
-            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if dir_name == "EDGAR Defense" {
-                continue;
-            }
-            scan_dir_recursive(&path, result);
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            let lower = name.to_lowercase();
-            if lower.ends_with(".csv") && result.csv_file.is_none() {
-                result.csv_file = Some(path);
-            } else if lower.ends_with(".txt")
-                && lower.contains("concise")
-                && result.concise_file.is_none()
-            {
-                result.concise_file = Some(path);
-            } else if lower.ends_with(".txt")
-                && lower.contains("hotspot")
-                && result.hotspot_file.is_none()
-            {
-                result.hotspot_file = Some(path);
-            }
-        }
-    }
-}
-
-/// Parse the Concise EDGAR Report to extract subject player BBO usernames.
-///
-/// Reads lines between the header row ("Name  Detector ...") and the separator
-/// ("---..."). The first whitespace-delimited token on each data line is the
-/// username. "pair" is skipped. Returns unique names in order of first appearance.
-fn parse_concise_usernames(path: &Path) -> Vec<String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut in_data = false;
-    let mut seen = std::collections::HashSet::new();
-    let mut names = Vec::new();
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Detect the header row to know data follows
-        if trimmed.starts_with("Name") && trimmed.contains("Detector") {
-            in_data = true;
-            continue;
-        }
-
-        // Stop at separator line
-        if in_data && trimmed.starts_with("---") {
-            break;
-        }
-
-        if in_data {
-            if let Some(name) = trimmed.split_whitespace().next() {
-                if name != "pair" && !name.is_empty() && seen.insert(name.to_string()) {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    names
-}
-
-/// Extract the subject name from a Concise report filename.
-///
-/// Given a filename like "Concise AWilliams.txt", returns "AWilliams".
-/// Strips a leading "Concise" (case-insensitive) prefix and the file extension.
-fn extract_concise_subject(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let name = if let Some(rest) = stem.strip_prefix("Concise ") {
-        rest.trim()
-    } else if let Some(rest) = stem.strip_prefix("concise ") {
-        rest.trim()
-    } else {
-        stem.trim()
-    };
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
     }
 }
 
@@ -1840,33 +1644,24 @@ fn tab_button(label: &str, tab: TabId, active: TabId) -> Element<'_, Message> {
     }
 }
 
-/// Render a file picker row: label + text input + browse button.
-fn file_picker<'a, F>(
-    label: &'a str,
-    value: &str,
-    on_change: F,
-    on_browse: Message,
-    disabled: bool,
-) -> Element<'a, Message>
-where
-    F: Fn(String) -> Message + 'a,
-{
-    let owned_value = value.to_string();
-    let input = text_input("Select file...", &owned_value).on_input_maybe(if disabled {
-        None
+/// Render a read-only file path row: label + path in green (or grey if empty).
+fn file_display_row<'a>(label: &'a str, path: &str) -> Element<'a, Message> {
+    let (display, color) = if path.is_empty() {
+        (
+            "-- not set --".to_string(),
+            iced::Color::from_rgb(0.6, 0.6, 0.6),
+        )
     } else {
-        Some(on_change)
-    });
+        (path.to_string(), iced::Color::from_rgb(0.4, 0.9, 0.4))
+    };
 
-    let mut browse = button(text("Browse").size(13));
-    if !disabled {
-        browse = browse.on_press(on_browse);
-    }
-
-    row![text(label).width(130), input.width(Fill), browse,]
-        .spacing(10)
-        .align_y(Center)
-        .into()
+    row![
+        text(label).size(13).width(130),
+        text(display).size(13).color(color).width(Fill),
+    ]
+    .spacing(10)
+    .align_y(Center)
+    .into()
 }
 
 // ============================================================================
@@ -1921,9 +1716,20 @@ fn config_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".edgar-toolkit.conf"))
 }
 
-/// Load deal limit settings from config file. Returns (enabled, count) with defaults.
-fn load_config() -> (bool, String) {
-    let defaults = (true, "1000".to_string());
+/// Persisted settings loaded from config file.
+struct AppConfig {
+    deal_limit_enabled: bool,
+    deal_limit_count: String,
+    case_folder: String,
+}
+
+/// Load settings from config file.
+fn load_config() -> AppConfig {
+    let defaults = AppConfig {
+        deal_limit_enabled: true,
+        deal_limit_count: "1000".to_string(),
+        case_folder: String::new(),
+    };
     let path = match config_path() {
         Some(p) => p,
         None => return defaults,
@@ -1934,28 +1740,28 @@ fn load_config() -> (bool, String) {
         Err(_) => return defaults,
     };
 
-    let mut enabled = true;
-    let mut count = "1000".to_string();
+    let mut cfg = defaults;
 
     for line in content.lines() {
         if let Some((key, value)) = line.split_once('=') {
             match key.trim() {
-                "deal_limit_enabled" => enabled = value.trim() == "true",
-                "deal_limit_count" => count = value.trim().to_string(),
+                "deal_limit_enabled" => cfg.deal_limit_enabled = value.trim() == "true",
+                "deal_limit_count" => cfg.deal_limit_count = value.trim().to_string(),
+                "case_folder" => cfg.case_folder = value.trim().to_string(),
                 _ => {}
             }
         }
     }
 
-    (enabled, count)
+    cfg
 }
 
-/// Save deal limit settings to config file.
-fn save_config(enabled: bool, count: &str) {
+/// Save settings to config file.
+fn save_config(enabled: bool, count: &str, case_folder: &str) {
     if let Some(path) = config_path() {
         let content = format!(
-            "deal_limit_enabled={}\ndeal_limit_count={}\n",
-            enabled, count
+            "deal_limit_enabled={}\ndeal_limit_count={}\ncase_folder={}\n",
+            enabled, count, case_folder
         );
         let _ = std::fs::write(&path, content);
     }
@@ -1965,20 +1771,60 @@ fn save_config(enabled: bool, count: &str) {
 // Subprocess runner
 // ============================================================================
 
-/// Find the `bbo-csv` CLI binary next to the current executable, or fall back to PATH.
-fn find_bbo_csv() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("Failed to find current exe: {}", e))?;
-    let mut bbo_csv = exe
-        .parent()
-        .map(|p| p.join("bbo-csv"))
-        .unwrap_or_else(|| PathBuf::from("bbo-csv"));
-    if cfg!(windows) {
-        bbo_csv.set_extension("exe");
-    }
-    if !bbo_csv.exists() {
-        bbo_csv = PathBuf::from("bbo-csv");
-    }
-    Ok(bbo_csv)
+/// Run anonymize directly via the library and stream progress updates to the UI.
+///
+/// Returns a stream of `Message` values: `ProgressUpdate` during execution,
+/// and a final `TaskFinished` when complete or cancelled.
+fn anonymize_stream(
+    config: pipeline::AnonymizeAllConfig,
+    cancel: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Message> {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+
+    std::thread::spawn(move || {
+        let result = pipeline::anonymize_all(&config, |p| {
+            let _ = tx.unbounded_send(Message::ProgressUpdate {
+                completed: p.completed,
+                total: p.total,
+                errors: 0,
+                skipped: 0,
+                phase: p.phase.to_string(),
+            });
+            !cancel.load(Ordering::Relaxed)
+        });
+
+        let _ = tx.unbounded_send(Message::TaskFinished(result.map_err(|e| e.to_string())));
+    });
+
+    rx
+}
+
+/// Run DD analysis directly via the library and stream progress updates to the UI.
+///
+/// Returns a stream of `Message` values: `ProgressUpdate` during execution,
+/// and a final `TaskFinished` when complete or cancelled.
+fn analyze_dd_stream(
+    config: pipeline::AnalyzeDdConfig,
+    cancel: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Message> {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+
+    std::thread::spawn(move || {
+        let result = pipeline::analyze_dd(&config, |p| {
+            let _ = tx.unbounded_send(Message::ProgressUpdate {
+                completed: p.completed,
+                total: p.total,
+                errors: p.errors,
+                skipped: p.skipped,
+                phase: String::new(),
+            });
+            !cancel.load(Ordering::Relaxed)
+        });
+
+        let _ = tx.unbounded_send(Message::TaskFinished(result.map_err(|e| e.to_string())));
+    });
+
+    rx
 }
 
 /// Run fetch-cardplay directly via the library and stream progress updates to the UI.
@@ -2013,6 +1859,7 @@ fn fetch_cardplay_stream(
                 total: p.total,
                 errors: p.errors,
                 skipped: p.skipped,
+                phase: String::new(),
             });
             !cancel.load(Ordering::Relaxed)
         });
@@ -2021,39 +1868,4 @@ fn fetch_cardplay_stream(
     });
 
     rx
-}
-
-/// Run the `bbo-csv` CLI binary as a subprocess, returning combined output.
-fn run_bbo_csv(args: Vec<String>) -> Result<String, String> {
-    let bbo_csv = find_bbo_csv()?;
-
-    let output = std::process::Command::new(&bbo_csv)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to run bbo-csv at {:?}: {}", bbo_csv, e))?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    if output.status.success() {
-        let mut result = String::new();
-        if !stderr.is_empty() {
-            result.push_str(&stderr);
-        }
-        if !stdout.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&stdout);
-        }
-        if result.is_empty() {
-            result = "Done.".to_string();
-        }
-        Ok(result)
-    } else {
-        Err(format!(
-            "bbo-csv exited with status {}:\n{}",
-            output.status, stderr
-        ))
-    }
 }

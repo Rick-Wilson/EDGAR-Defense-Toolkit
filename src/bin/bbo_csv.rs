@@ -5,26 +5,21 @@
 //! double-dummy analysis.
 
 use anyhow::{Context, Result};
-use bridge_parsers::lin::parse_lin_from_url;
-use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, SOUTH, SPADE, WEST};
-use edgar_defense_toolkit::dd_analysis::compute_dd_costs;
-// Card, Rank, Suit only used in #[cfg(test)] functions
 #[cfg(test)]
 use bridge_parsers::{Card, Rank, Suit};
 #[cfg(test)]
 use bridge_solver::cards::card_of;
 #[cfg(test)]
 use bridge_solver::NOTRUMP;
+#[cfg(test)]
+use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, SOUTH, SPADE, WEST};
 use clap::{Parser, Subcommand};
-use csv::{ReaderBuilder, StringRecord, Writer};
-use rayon::prelude::*;
+use csv::{ReaderBuilder, Writer};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 // ============================================================================
 // BBO CSV Preprocessing - Fix malformed quoted fields
@@ -213,6 +208,25 @@ enum Commands {
         #[arg(short = 'n', long)]
         row: usize,
     },
+
+    /// Create Excel workbook(s) from case folder.
+    ///
+    /// Scans the folder for BBO CSV, Concise report, and Hotspot report.
+    /// Creates "EDGAR Defense {subject}.xlsx" in the EDGAR Defense subfolder.
+    /// If anonymized files are found, also creates an anonymized workbook.
+    Package {
+        /// Case folder path (scanned for CSV, Concise, Hotspot files)
+        #[arg(short, long)]
+        folder: PathBuf,
+
+        /// Subject player usernames for conditional formatting (comma-separated)
+        #[arg(short, long, value_delimiter = ',')]
+        subjects: Vec<String>,
+
+        /// Optional deal limit (only include first N boards)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -230,9 +244,11 @@ fn main() -> Result<()> {
             resume,
         } => {
             use edgar_defense_toolkit::pipeline;
+            let lookup_output = pipeline::derive_lookup_path(&output);
             let config = pipeline::FetchCardplayConfig {
                 input,
                 output,
+                lookup_output,
                 url_column,
                 delay_ms,
                 batch_size,
@@ -256,7 +272,23 @@ fn main() -> Result<()> {
             resume,
             checkpoint_interval,
         } => {
-            analyze_dd(&input, &output, threads, resume, checkpoint_interval)?;
+            use edgar_defense_toolkit::pipeline;
+            let config = pipeline::AnalyzeDdConfig {
+                input,
+                output,
+                threads,
+                resume,
+                checkpoint_interval,
+            };
+            let summary = pipeline::analyze_dd(&config, |p| {
+                eprint!(
+                    "\r[{}/{}] Analyzing DD... ({} errors)    ",
+                    p.completed, p.total, p.errors
+                );
+                std::io::stderr().flush().ok();
+                true // never cancel from CLI
+            })?;
+            eprintln!("\n{}", summary);
         }
         Commands::Anonymize {
             input,
@@ -277,6 +309,79 @@ fn main() -> Result<()> {
         Commands::DisplayHand { input, row } => {
             display_hand(&input, row)?;
         }
+        Commands::Package {
+            folder,
+            subjects,
+            limit,
+        } => {
+            use edgar_defense_toolkit::pipeline;
+
+            let case_files = pipeline::scan_case_folder(&folder);
+            let csv = case_files
+                .csv_file
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No CSV file found in {}", folder.display()))?;
+            let concise = case_files.concise_file.clone().ok_or_else(|| {
+                anyhow::anyhow!("No Concise report found in {}", folder.display())
+            })?;
+            let hotspot = case_files.hotspot_file.clone().ok_or_else(|| {
+                anyhow::anyhow!("No Hotspot report found in {}", folder.display())
+            })?;
+
+            let subject =
+                pipeline::extract_concise_subject(&concise).unwrap_or_else(|| "Report".to_string());
+
+            let edgar_dir = folder.join("EDGAR Defense");
+            let output = edgar_dir.join(format!("EDGAR Defense {}.xlsx", subject));
+
+            // Look for cardplay CSV in EDGAR Defense folder
+            let cardplay_file = std::fs::read_dir(&edgar_dir).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .find(|e| {
+                        let name = e.file_name().to_string_lossy().to_lowercase();
+                        name.ends_with(".csv")
+                            && name.contains("cardplay")
+                            && !name.contains("anon")
+                    })
+                    .map(|e| e.path())
+            });
+
+            let config = pipeline::PackageConfig {
+                csv_file: csv,
+                hotspot_file: hotspot,
+                concise_file: concise,
+                output: output.clone(),
+                case_folder: folder.display().to_string(),
+                subject_players: subjects.clone(),
+                deal_limit: limit,
+                cardplay_file,
+            };
+
+            eprintln!("Creating {}...", output.display());
+            let summary = pipeline::package_workbook(&config)?;
+            eprintln!("{}", summary);
+
+            // Check for anon files and create anon workbook
+            if let Some(anon_files) = pipeline::find_anon_files(&edgar_dir, &case_files) {
+                let anon_output = edgar_dir.join(format!("EDGAR Defense {} anon.xlsx", subject));
+
+                let anon_config = pipeline::PackageConfig {
+                    csv_file: anon_files.csv_file,
+                    hotspot_file: anon_files.hotspot_file,
+                    concise_file: anon_files.concise_file,
+                    output: anon_output.clone(),
+                    case_folder: folder.display().to_string(),
+                    subject_players: subjects,
+                    deal_limit: limit,
+                    cardplay_file: None,
+                };
+
+                eprintln!("\nCreating {}...", anon_output.display());
+                let anon_summary = pipeline::package_workbook(&anon_config)?;
+                eprintln!("{}", anon_summary);
+            }
+        }
     }
 
     Ok(())
@@ -289,886 +394,9 @@ fn count_csv_rows(path: &PathBuf) -> Result<usize> {
     Ok(reader.lines().count().saturating_sub(1))
 }
 
-fn load_existing_refs(output: &PathBuf, column: &str) -> Result<HashSet<String>> {
-    let mut refs = HashSet::new();
-    let mut reader = ReaderBuilder::new().flexible(true).from_path(output)?;
-
-    let headers = reader.headers()?.clone();
-    let ref_idx = headers.iter().position(|h| h == "Ref #");
-    let col_idx = headers.iter().position(|h| h == column);
-
-    if ref_idx.is_none() || col_idx.is_none() {
-        return Ok(refs);
-    }
-
-    let ref_idx = ref_idx.unwrap();
-    let col_idx = col_idx.unwrap();
-
-    for result in reader.records() {
-        let record = result?;
-        let ref_id = record.get(ref_idx).unwrap_or("");
-        let value = record.get(col_idx).unwrap_or("");
-
-        // Only consider it "done" if value is non-empty and not an error
-        if !value.is_empty() && !value.starts_with("ERROR:") {
-            refs.insert(ref_id.to_string());
-        }
-    }
-
-    Ok(refs)
-}
-
 // ============================================================================
-// DD Analysis Implementation
+// Test-only helpers
 // ============================================================================
-
-/// Represents a row to be processed for DD analysis
-#[derive(Clone)]
-struct DdWorkItem {
-    row_idx: usize,
-    #[allow(dead_code)]
-    ref_id: String,
-    deal_pbn: String,
-    cardplay: String,
-    contract: String,
-    declarer: String,
-    max_dd: Option<i8>, // From input file, -1 means incomplete hand
-}
-
-/// Result stored for each processed row
-struct DdResultEntry {
-    analysis: String,
-    computed_dd: Option<u8>,
-    input_max_dd: Option<i8>,
-    /// Opening lead error (1 if cost a trick, 0 otherwise)
-    ol_error: u8,
-    /// Per-seat play counts (N, S, E, W)
-    plays_n: u8,
-    plays_s: u8,
-    plays_e: u8,
-    plays_w: u8,
-    /// Per-seat error counts (N, S, E, W)
-    errors_n: u8,
-    errors_s: u8,
-    errors_e: u8,
-    errors_w: u8,
-}
-
-fn analyze_dd(
-    input: &PathBuf,
-    output: &PathBuf,
-    threads: Option<usize>,
-    resume: bool,
-    checkpoint_interval: usize,
-) -> Result<()> {
-    // Configure thread pool
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok(); // Ignore error if already initialized
-    }
-
-    // Read input CSV with flexible field count to handle malformed rows
-    let mut reader = ReaderBuilder::new()
-        .flexible(true)
-        .from_path(input)
-        .context("Failed to open input CSV")?;
-    let headers = reader.headers()?.clone();
-
-    // Find required columns
-    let col_indices = find_required_columns(&headers)?;
-
-    // Check if DD columns already exist
-    let dd_col_exists = headers.iter().any(|h| h == "DD_Analysis");
-
-    // Load existing results if resuming
-    let existing_refs: HashSet<String> = if resume && output.exists() {
-        load_existing_refs(output, "DD_Analysis")?
-    } else {
-        HashSet::new()
-    };
-
-    // Prepare output headers - add all DD columns if they don't exist
-    let mut output_headers = headers.clone();
-    if !dd_col_exists {
-        output_headers.push_field("Contract_DD");
-        output_headers.push_field("DD_Match");
-        output_headers.push_field("DD_OL_Error");
-        output_headers.push_field("DD_N_Plays");
-        output_headers.push_field("DD_S_Plays");
-        output_headers.push_field("DD_E_Plays");
-        output_headers.push_field("DD_W_Plays");
-        output_headers.push_field("DD_N_Errors");
-        output_headers.push_field("DD_S_Errors");
-        output_headers.push_field("DD_E_Errors");
-        output_headers.push_field("DD_W_Errors");
-        output_headers.push_field("DD_Analysis");
-    }
-
-    // Collect all rows and prepare work items
-    let mut all_records: Vec<StringRecord> = Vec::new();
-    let mut work_items: Vec<DdWorkItem> = Vec::new();
-    let mut skipped_incomplete = 0usize;
-    let mut skipped_passout = 0usize;
-
-    for (row_idx, result) in reader.records().enumerate() {
-        let record = result.context("Failed to read CSV row")?;
-        all_records.push(record.clone());
-
-        let ref_id = record.get(col_indices.ref_col).unwrap_or("").to_string();
-
-        // Skip if already processed (resume mode)
-        if resume && existing_refs.contains(&ref_id) {
-            continue;
-        }
-
-        // Get Max DD from input (if column exists)
-        let max_dd: Option<i8> = col_indices
-            .max_dd_col
-            .and_then(|col| record.get(col))
-            .and_then(|s| s.parse::<i8>().ok());
-
-        // Skip incomplete hands (Max DD = -1)
-        if max_dd == Some(-1) {
-            skipped_incomplete += 1;
-            continue;
-        }
-
-        // Get the cardplay
-        let cardplay = record
-            .get(col_indices.cardplay_col)
-            .unwrap_or("")
-            .to_string();
-
-        if cardplay.is_empty() || cardplay.starts_with("ERROR:") {
-            continue;
-        }
-
-        // Extract deal, contract, and declarer from row
-        if let Some(row_data) = extract_row_data(&record, &col_indices) {
-            // Skip passout hands (contract starts with "0" or is "P" or "Pass")
-            let contract_upper = row_data.contract.to_uppercase();
-            if contract_upper.starts_with("0") || contract_upper == "P" || contract_upper == "PASS"
-            {
-                skipped_passout += 1;
-                continue;
-            }
-
-            work_items.push(DdWorkItem {
-                row_idx,
-                ref_id,
-                deal_pbn: row_data.deal_pbn,
-                cardplay,
-                contract: row_data.contract,
-                declarer: row_data.declarer,
-                max_dd,
-            });
-        }
-    }
-
-    let total_rows = all_records.len();
-    let to_process = work_items.len();
-
-    eprintln!(
-        "Found {} rows, {} need DD analysis ({} already done, {} incomplete, {} passout)",
-        total_rows,
-        to_process,
-        total_rows - to_process - skipped_incomplete - skipped_passout,
-        skipped_incomplete,
-        skipped_passout
-    );
-
-    if to_process == 0 {
-        eprintln!("Nothing to do!");
-        return Ok(());
-    }
-
-    // Progress tracking
-    let processed_count = AtomicUsize::new(0);
-    let error_count = AtomicUsize::new(0);
-
-    // Store results in a thread-safe map (includes computed DD for validation)
-    let results: Mutex<HashMap<usize, DdResultEntry>> = Mutex::new(HashMap::new());
-
-    // Process work items in parallel
-    work_items.par_iter().for_each(|item| {
-        let entry = match compute_dd_analysis(item) {
-            Ok(output) => DdResultEntry {
-                analysis: output.analysis,
-                computed_dd: Some(output.initial_dd),
-                input_max_dd: item.max_dd,
-                ol_error: output.ol_error,
-                plays_n: output.plays_n,
-                plays_s: output.plays_s,
-                plays_e: output.plays_e,
-                plays_w: output.plays_w,
-                errors_n: output.errors_n,
-                errors_s: output.errors_s,
-                errors_e: output.errors_e,
-                errors_w: output.errors_w,
-            },
-            Err(e) => {
-                error_count.fetch_add(1, Ordering::Relaxed);
-                log::warn!("Row {}: DD analysis error: {}", item.row_idx + 1, e);
-                DdResultEntry {
-                    analysis: format!("ERROR: {}", e),
-                    computed_dd: None,
-                    input_max_dd: item.max_dd,
-                    ol_error: 0,
-                    plays_n: 0,
-                    plays_s: 0,
-                    plays_e: 0,
-                    plays_w: 0,
-                    errors_n: 0,
-                    errors_s: 0,
-                    errors_e: 0,
-                    errors_w: 0,
-                }
-            }
-        };
-
-        // Store result with validation info
-        results.lock().unwrap().insert(item.row_idx, entry);
-
-        // Update progress
-        let count = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(10) || count == to_process {
-            let errors = error_count.load(Ordering::Relaxed);
-            eprint!(
-                "\r[{}/{}] Analyzing DD... ({} errors)    ",
-                count, to_process, errors
-            );
-            std::io::stderr().flush().ok();
-        }
-    });
-
-    eprintln!(); // New line after progress
-
-    // Write output and collect validation statistics
-    let results_map = results.into_inner().unwrap();
-    let mut writer = Writer::from_path(output).context("Failed to create output CSV")?;
-    writer.write_record(&output_headers)?;
-
-    let mut dd_matches = 0usize;
-    let mut dd_mismatches: Vec<(usize, u8, i8)> = Vec::new(); // (row, computed, input)
-
-    for (row_idx, record) in all_records.iter().enumerate() {
-        let mut output_record = record.clone();
-
-        if !dd_col_exists {
-            // Add all DD columns
-            if let Some(entry) = results_map.get(&row_idx) {
-                output_record
-                    .push_field(&entry.computed_dd.map(|d| d.to_string()).unwrap_or_default());
-                // DD_Match: true if computed DD matches input Max DD (or empty if no Max DD)
-                let dd_match = match (entry.computed_dd, entry.input_max_dd) {
-                    (Some(computed), Some(input)) if input >= 0 => {
-                        if computed as i8 == input {
-                            "true"
-                        } else {
-                            "false"
-                        }
-                    }
-                    _ => "", // No comparison possible (missing data or incomplete hand)
-                };
-                output_record.push_field(dd_match);
-                output_record.push_field(&entry.ol_error.to_string());
-                output_record.push_field(&entry.plays_n.to_string());
-                output_record.push_field(&entry.plays_s.to_string());
-                output_record.push_field(&entry.plays_e.to_string());
-                output_record.push_field(&entry.plays_w.to_string());
-                output_record.push_field(&entry.errors_n.to_string());
-                output_record.push_field(&entry.errors_s.to_string());
-                output_record.push_field(&entry.errors_e.to_string());
-                output_record.push_field(&entry.errors_w.to_string());
-                output_record.push_field(&entry.analysis);
-            } else {
-                // Empty values for rows we didn't process (12 columns now)
-                for _ in 0..12 {
-                    output_record.push_field("");
-                }
-            }
-        }
-
-        // Check DD validation (only for rows we processed with valid Max DD)
-        if let Some(entry) = results_map.get(&row_idx) {
-            if let (Some(computed), Some(input_dd)) = (entry.computed_dd, entry.input_max_dd) {
-                // Skip -1 values in validation (incomplete hands)
-                if input_dd >= 0 {
-                    if computed as i8 == input_dd {
-                        dd_matches += 1;
-                    } else {
-                        // row_idx + 2: +1 for 0-to-1 indexing, +1 for header row
-                        dd_mismatches.push((row_idx + 2, computed, input_dd));
-                    }
-                }
-            }
-        }
-
-        writer.write_record(&output_record)?;
-
-        // Checkpoint
-        if (row_idx + 1) % checkpoint_interval == 0 {
-            writer.flush()?;
-        }
-    }
-
-    writer.flush()?;
-
-    let errors = error_count.load(Ordering::Relaxed);
-    eprintln!("Done! Analyzed {} rows ({} errors)", to_process, errors);
-
-    // Report DD validation statistics
-    if dd_matches > 0 || !dd_mismatches.is_empty() {
-        eprintln!();
-        eprintln!("=== DD Validation (Initial DD vs Max DD) ===");
-        eprintln!("Matches: {}", dd_matches);
-        eprintln!("Mismatches: {}", dd_mismatches.len());
-
-        if !dd_mismatches.is_empty() {
-            eprintln!();
-            eprintln!("Mismatch details (row, computed, input):");
-            for (row, computed, input) in dd_mismatches.iter().take(20) {
-                eprintln!("  Row {}: computed={}, input={}", row, computed, input);
-            }
-            if dd_mismatches.len() > 20 {
-                eprintln!("  ... and {} more", dd_mismatches.len() - 20);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Column indices for required fields
-struct ColumnIndices {
-    ref_col: usize,
-    cardplay_col: usize,
-    contract_col: Option<usize>,
-    declarer_col: Option<usize>,
-    lin_url_col: Option<usize>,
-    max_dd_col: Option<usize>,
-    // Hand columns (actual PBN-style hand data, not player names)
-    north_col: Option<usize>,
-    south_col: Option<usize>,
-    east_col: Option<usize>,
-    west_col: Option<usize>,
-}
-
-fn find_required_columns(headers: &StringRecord) -> Result<ColumnIndices> {
-    let find = |name: &str| -> Result<usize> {
-        headers
-            .iter()
-            .position(|h| h == name)
-            .ok_or_else(|| anyhow::anyhow!("Required column '{}' not found", name))
-    };
-
-    let find_optional = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
-
-    let lin_url_col = find_optional("LIN_URL");
-    let contract_col = find_optional("Con");
-    let declarer_col = find_optional("Dec");
-
-    // We need either LIN_URL (which has everything) or Con+Dec columns
-    if lin_url_col.is_none() && (contract_col.is_none() || declarer_col.is_none()) {
-        return Err(anyhow::anyhow!(
-            "CSV must have either 'LIN_URL' column or both 'Con' and 'Dec' columns"
-        ));
-    }
-
-    Ok(ColumnIndices {
-        ref_col: find("Ref #")?,
-        cardplay_col: find("Cardplay")?,
-        contract_col,
-        declarer_col,
-        lin_url_col,
-        max_dd_col: find_optional("Max DD"),
-        // Look for hand columns (might be PBN-style hands or player names)
-        north_col: find_optional("North").or_else(|| find_optional("N_Hand")),
-        south_col: find_optional("South").or_else(|| find_optional("S_Hand")),
-        east_col: find_optional("East").or_else(|| find_optional("E_Hand")),
-        west_col: find_optional("West").or_else(|| find_optional("W_Hand")),
-    })
-}
-
-/// Data extracted from a row for DD analysis
-struct RowData {
-    deal_pbn: String,
-    contract: String,
-    declarer: String,
-}
-
-/// Extract deal, contract, and declarer from a CSV row
-/// Prefers explicit columns (Con, Dec, hand columns) but falls back to LIN_URL
-fn extract_row_data(record: &StringRecord, cols: &ColumnIndices) -> Option<RowData> {
-    // Try to get contract and declarer from explicit columns first
-    let contract_from_col = cols
-        .contract_col
-        .and_then(|i| record.get(i))
-        .map(|s| s.to_string());
-    let declarer_from_col = cols
-        .declarer_col
-        .and_then(|i| record.get(i))
-        .map(|s| s.to_string());
-
-    // Try to get deal from hand columns (if they contain actual hand data)
-    let deal_from_hands = build_deal_from_hand_cols(record, cols);
-
-    // If we have hand columns with valid data, use them
-    if let Some(deal_pbn) = deal_from_hands {
-        if let (Some(contract), Some(declarer)) =
-            (contract_from_col.clone(), declarer_from_col.clone())
-        {
-            if !contract.is_empty() && !declarer.is_empty() {
-                return Some(RowData {
-                    deal_pbn,
-                    contract,
-                    declarer,
-                });
-            }
-        }
-    }
-
-    // Fall back to LIN_URL
-    if let Some(lin_url_col) = cols.lin_url_col {
-        if let Some(url) = record.get(lin_url_col) {
-            if !url.is_empty() {
-                if let Ok(lin_data) = parse_lin_from_url(url) {
-                    let deal_pbn = lin_data.deal.to_pbn(bridge_parsers::Direction::North);
-
-                    // Use explicit columns if available, otherwise extract from LIN
-                    let contract = contract_from_col
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| extract_contract_from_lin(&lin_data));
-                    let declarer = declarer_from_col
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| extract_declarer_from_lin(&lin_data));
-
-                    if !contract.is_empty() && !declarer.is_empty() {
-                        return Some(RowData {
-                            deal_pbn,
-                            contract,
-                            declarer,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Try to build a PBN deal from hand columns
-/// Returns None if columns don't exist or don't contain valid hand data
-fn build_deal_from_hand_cols(record: &StringRecord, cols: &ColumnIndices) -> Option<String> {
-    let get_hand = |col: Option<usize>| -> Option<&str> {
-        col.and_then(|i| record.get(i)).filter(|s| !s.is_empty())
-    };
-
-    let north = get_hand(cols.north_col)?;
-    let south = get_hand(cols.south_col)?;
-    let east = get_hand(cols.east_col)?;
-    let west = get_hand(cols.west_col)?;
-
-    // Check if these look like PBN hands (contain dots for suit separators)
-    // Player names won't have dots
-    if !north.contains('.') || !south.contains('.') {
-        return None;
-    }
-
-    Some(format!("N:{} {} {} {}", north, east, south, west))
-}
-
-/// Extract contract from LIN auction data
-fn extract_contract_from_lin(lin_data: &bridge_parsers::lin::LinData) -> String {
-    // Walk through auction to find final contract
-    let mut level = 0u8;
-    let mut suit = String::new();
-    let mut doubled = false;
-    let mut redoubled = false;
-
-    for bid in &lin_data.auction {
-        let bid_str = bid.bid.to_uppercase();
-
-        if bid_str == "P" || bid_str == "PASS" {
-            continue;
-        } else if bid_str == "D" || bid_str == "X" || bid_str == "DBL" {
-            doubled = true;
-            redoubled = false;
-        } else if bid_str == "R" || bid_str == "XX" || bid_str == "RDBL" {
-            redoubled = true;
-        } else if let Some(c) = bid_str.chars().next() {
-            if c.is_ascii_digit() {
-                level = c.to_digit(10).unwrap_or(0) as u8;
-                suit = bid_str[1..].to_string();
-                doubled = false;
-                redoubled = false;
-            }
-        }
-    }
-
-    if level == 0 {
-        return String::new(); // Passed out
-    }
-
-    let mut contract = format!("{}{}", level, suit);
-    if redoubled {
-        contract.push_str("XX");
-    } else if doubled {
-        contract.push('X');
-    }
-
-    contract
-}
-
-/// Extract declarer from LIN data by finding who holds the opening lead card
-/// This is more reliable than parsing the auction (which has artificial bids)
-fn extract_declarer_from_lin(lin_data: &bridge_parsers::lin::LinData) -> String {
-    use bridge_parsers::Direction;
-
-    // If there's cardplay, use the opening lead to determine the leader
-    // Then declarer is to the right of the leader
-    if !lin_data.play.is_empty() {
-        let opening_lead = &lin_data.play[0];
-
-        // Find which hand has this card
-        for dir in Direction::ALL {
-            let hand = lin_data.deal.hand(dir);
-            if hand.has_card(*opening_lead) {
-                // This player led, so declarer is to their right
-                let declarer = match dir {
-                    Direction::North => "W", // N leads means W declares
-                    Direction::East => "N",  // E leads means N declares
-                    Direction::South => "E", // S leads means E declares
-                    Direction::West => "S",  // W leads means S declares
-                };
-                return declarer.to_string();
-            }
-        }
-    }
-
-    // Fallback: try to determine from auction
-    extract_declarer_from_auction(lin_data)
-}
-
-/// Fallback: Extract declarer from auction (may be wrong for artificial bids)
-fn extract_declarer_from_auction(lin_data: &bridge_parsers::lin::LinData) -> String {
-    let mut level = 0u8;
-    let mut final_suit = String::new();
-    let mut final_bidder_idx = 0usize;
-
-    let dealer = lin_data.dealer;
-
-    for (i, bid) in lin_data.auction.iter().enumerate() {
-        let bid_str = bid.bid.to_uppercase();
-
-        if bid_str == "P"
-            || bid_str == "PASS"
-            || bid_str == "D"
-            || bid_str == "X"
-            || bid_str == "R"
-            || bid_str == "XX"
-            || bid_str == "DBL"
-            || bid_str == "RDBL"
-        {
-            continue;
-        }
-
-        if let Some(c) = bid_str.chars().next() {
-            if c.is_ascii_digit() {
-                level = c.to_digit(10).unwrap_or(0) as u8;
-                final_suit = bid_str[1..].to_string();
-                final_bidder_idx = i;
-            }
-        }
-    }
-
-    if level == 0 {
-        return String::new(); // Passed out
-    }
-
-    // The declarer is the first person on the declaring partnership to bid the suit
-    let declaring_side = (dealer as usize + final_bidder_idx) % 4;
-    let declaring_partnership = declaring_side % 2; // 0 = N/S, 1 = E/W
-
-    // Find first bid of final suit by the declaring partnership
-    for (i, bid) in lin_data.auction.iter().enumerate() {
-        let bid_str = bid.bid.to_uppercase();
-        let bidder = (dealer as usize + i) % 4;
-
-        if bidder % 2 != declaring_partnership {
-            continue;
-        }
-
-        if let Some(c) = bid_str.chars().next() {
-            if c.is_ascii_digit() {
-                let bid_suit = &bid_str[1..];
-                if bid_suit == final_suit {
-                    return match bidder {
-                        0 => "N".to_string(),
-                        1 => "E".to_string(),
-                        2 => "S".to_string(),
-                        3 => "W".to_string(),
-                        _ => String::new(),
-                    };
-                }
-            }
-        }
-    }
-
-    // Last fallback: just return the final bidder
-    match (dealer as usize + final_bidder_idx) % 4 {
-        0 => "N".to_string(),
-        1 => "E".to_string(),
-        2 => "S".to_string(),
-        3 => "W".to_string(),
-        _ => String::new(),
-    }
-}
-
-/// Result from DD analysis including validation info
-struct DdAnalysisOutput {
-    analysis: String,
-    initial_dd: u8,
-    /// Opening lead error (1 if cost a trick, 0 otherwise)
-    ol_error: u8,
-    /// Per-seat play counts (N, S, E, W)
-    plays_n: u8,
-    plays_s: u8,
-    plays_e: u8,
-    plays_w: u8,
-    /// Per-seat error counts (N, S, E, W)
-    errors_n: u8,
-    errors_s: u8,
-    errors_e: u8,
-    errors_w: u8,
-}
-
-/// Compute DD analysis for a single work item
-///
-/// For each card played, computes the DD cost of the actual play vs optimal.
-/// DD cost represents tricks lost by suboptimal play (0 = optimal or equivalent).
-/// Output format: T1:c1,c2,c3,c4|T2:c1,c2,c3,c4|... where each c is the cost for that card
-fn compute_dd_analysis(item: &DdWorkItem) -> Result<DdAnalysisOutput> {
-    // Use the shared library function for DD computation
-    let result = compute_dd_costs(
-        &item.deal_pbn,
-        &item.cardplay,
-        &item.contract,
-        &item.declarer,
-        false, // no debug output
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    if result.costs.is_empty() {
-        return Ok(DdAnalysisOutput {
-            analysis: String::new(),
-            initial_dd: result.initial_dd,
-            ol_error: 0,
-            plays_n: 0,
-            plays_s: 0,
-            plays_e: 0,
-            plays_w: 0,
-            errors_n: 0,
-            errors_s: 0,
-            errors_e: 0,
-            errors_w: 0,
-        });
-    }
-
-    // Track per-seat plays and errors
-    let mut plays = [0u8; 4]; // indexed by seat constant (NORTH, EAST, SOUTH, WEST)
-    let mut errors = [0u8; 4];
-
-    // Opening lead error: check if the first card of trick 1 cost a trick
-    let ol_error = if !result.costs.is_empty() && !result.costs[0].is_empty() {
-        if result.costs[0][0] > 0 {
-            1
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    // Parse cardplay to track trick winners
-    let tricks: Vec<Vec<&str>> = item
-        .cardplay
-        .split('|')
-        .filter(|s| !s.is_empty())
-        .map(|t| t.split_whitespace().collect())
-        .collect();
-
-    // Initial leader is left of declarer
-    let initial_leader = (result.declarer_seat + 1) % 4;
-    let mut current_leader = initial_leader;
-
-    for (trick_idx, card_costs) in result.costs.iter().enumerate() {
-        let mut seat = current_leader;
-
-        for &cost in card_costs.iter() {
-            plays[seat] += 1;
-            if cost > 0 {
-                errors[seat] += 1;
-            }
-            seat = (seat + 1) % 4;
-        }
-
-        // Determine trick winner for next trick's leader
-        // We need to parse the cards to determine the winner
-        if trick_idx < tricks.len() && tricks[trick_idx].len() == 4 {
-            // For simplicity, we'll track winners using the cardplay
-            // Parse trump from contract
-            let trump = parse_trump_for_winner(&item.contract);
-            if let Some(winner) =
-                determine_trick_winner_from_cards(&tricks[trick_idx], trump, current_leader)
-            {
-                current_leader = winner;
-            }
-            // If we can't determine the winner, keep current_leader unchanged
-        }
-    }
-
-    // Format the costs as T1:c1,c2,c3,c4|T2:c1,c2,c3,c4|...
-    let trick_results: Vec<String> = result
-        .costs
-        .iter()
-        .enumerate()
-        .map(|(trick_num, card_costs)| {
-            let costs_str = card_costs
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("T{}:{}", trick_num + 1, costs_str)
-        })
-        .collect();
-
-    Ok(DdAnalysisOutput {
-        analysis: trick_results.join("|"),
-        initial_dd: result.initial_dd,
-        ol_error,
-        plays_n: plays[NORTH],
-        plays_s: plays[SOUTH],
-        plays_e: plays[EAST],
-        plays_w: plays[WEST],
-        errors_n: errors[NORTH],
-        errors_s: errors[SOUTH],
-        errors_e: errors[EAST],
-        errors_w: errors[WEST],
-    })
-}
-
-/// Parse trump suit from contract for trick winner determination
-fn parse_trump_for_winner(contract: &str) -> Option<usize> {
-    let contract = contract.trim().to_uppercase();
-    if contract.contains("NT") {
-        return None; // No trump
-    }
-    for c in contract.chars() {
-        match c {
-            'S' => return Some(SPADE),
-            'H' => return Some(HEART),
-            'D' => return Some(DIAMOND),
-            'C' => return Some(CLUB),
-            _ => continue,
-        }
-    }
-    None
-}
-
-/// Determine trick winner from card strings
-fn determine_trick_winner_from_cards(
-    cards: &[&str],
-    trump: Option<usize>,
-    leader: usize,
-) -> Option<usize> {
-    if cards.len() != 4 {
-        return None;
-    }
-
-    // Parse cards to (suit, rank) where higher rank = better
-    let parsed: Vec<Option<(usize, u8)>> = cards
-        .iter()
-        .map(|s| {
-            if s.len() < 2 {
-                return None;
-            }
-            let suit = match s.chars().next()? {
-                'S' | 's' => SPADE,
-                'H' | 'h' => HEART,
-                'D' | 'd' => DIAMOND,
-                'C' | 'c' => CLUB,
-                _ => return None,
-            };
-            let rank_char = s.chars().nth(1)?;
-            let rank = match rank_char {
-                'A' | 'a' => 14,
-                'K' | 'k' => 13,
-                'Q' | 'q' => 12,
-                'J' | 'j' => 11,
-                'T' | 't' | '1' => 10,
-                '9' => 9,
-                '8' => 8,
-                '7' => 7,
-                '6' => 6,
-                '5' => 5,
-                '4' => 4,
-                '3' => 3,
-                '2' => 2,
-                _ => return None,
-            };
-            Some((suit, rank))
-        })
-        .collect();
-
-    // All cards must parse
-    let cards_parsed: Vec<(usize, u8)> = parsed.into_iter().collect::<Option<Vec<_>>>()?;
-
-    let led_suit = cards_parsed[0].0;
-    let mut winner_idx = 0;
-    let mut winner_card = cards_parsed[0];
-
-    for (i, &(suit, rank)) in cards_parsed.iter().enumerate().skip(1) {
-        let dominated = if let Some(trump_suit) = trump {
-            if suit == trump_suit && winner_card.0 != trump_suit {
-                // This card is trump, winner is not
-                true
-            } else if suit == trump_suit && winner_card.0 == trump_suit {
-                // Both trump, higher wins
-                rank > winner_card.1
-            } else if winner_card.0 == trump_suit {
-                // Winner is trump, this is not
-                false
-            } else if suit == led_suit && winner_card.0 == led_suit {
-                // Both follow suit, higher wins
-                rank > winner_card.1
-            } else if suit == led_suit {
-                // This follows suit, winner doesn't
-                true
-            } else {
-                // Neither trump nor following suit
-                false
-            }
-        } else {
-            // No trump
-            if suit == led_suit && winner_card.0 == led_suit {
-                rank > winner_card.1
-            } else {
-                suit == led_suit
-            }
-        };
-
-        if dominated {
-            winner_idx = i;
-            winner_card = (suit, rank);
-        }
-    }
-
-    Some((leader + winner_idx) % 4)
-}
 
 // Functions below are used by tests only
 #[cfg(test)]
@@ -1832,11 +1060,22 @@ fn anonymize_csv(
     map: &str,
     columns: &[String],
 ) -> Result<()> {
+    use edgar_defense_toolkit::pipeline;
+
     if key.is_empty() {
         return Err(anyhow::anyhow!(
             "Anonymization key is required. Set BBO_ANON_KEY env var or use --key"
         ));
     }
+
+    // Load tinyurl → Board_ID mapping from lookup file if available
+    let lookup_path = pipeline::derive_lookup_path(input);
+    let board_id_map = if lookup_path.exists() {
+        eprintln!("Loading Board_ID mappings from: {}", lookup_path.display());
+        pipeline::load_lookup_board_ids(&lookup_path)?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Read and preprocess input CSV to fix BBO's malformed quoting
     let csv_data = read_bbo_csv_fixed(input)?;
@@ -1860,6 +1099,7 @@ fn anonymize_csv(
 
     // Find LIN_URL column for special handling (contains embedded usernames)
     let lin_url_idx = headers.iter().position(|h| h == "LIN_URL");
+    let bbo_col_idx = headers.iter().position(|h| h == "BBO");
 
     eprintln!(
         "Anonymizing columns: {:?}{}",
@@ -1904,6 +1144,14 @@ fn anonymize_csv(
             } else if Some(i) == lin_url_idx && !field.is_empty() {
                 // Special handling for LIN_URL - anonymize embedded player names
                 output_fields.push(anonymize_lin_url(field, &mut anonymizer));
+            } else if Some(i) == bbo_col_idx && !field.is_empty() && !board_id_map.is_empty() {
+                // Replace tinyurl with Board_ID
+                let key = pipeline::normalize_tinyurl(field);
+                if let Some((board_id, _)) = board_id_map.get(&key) {
+                    output_fields.push(board_id.clone());
+                } else {
+                    output_fields.push(field.to_string());
+                }
             } else {
                 output_fields.push(field.to_string());
             }

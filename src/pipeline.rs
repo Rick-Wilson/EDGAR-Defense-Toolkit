@@ -4,12 +4,17 @@
 //! returning structured data instead of printing to stdout.
 
 use anyhow::{Context, Result};
-use bridge_parsers::lin::parse_lin_from_url;
+use bridge_parsers::lin::{parse_lin_from_url, LinData};
 use bridge_parsers::tinyurl::UrlResolver;
-use csv::ReaderBuilder;
-use std::collections::HashMap;
+use bridge_parsers::{Direction, Vulnerability};
+use bridge_solver::{CLUB, DIAMOND, EAST, HEART, NORTH, SOUTH, SPADE, WEST};
+use csv::{ReaderBuilder, StringRecord, Writer};
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 // ============================================================================
 // Fetch Cardplay
@@ -19,8 +24,10 @@ use std::path::Path;
 pub struct FetchCardplayConfig {
     /// Input CSV path
     pub input: PathBuf,
-    /// Output CSV path
+    /// Output CSV path (the merged cardplay CSV)
     pub output: PathBuf,
+    /// Path for the intermediate tinyurl lookup file
+    pub lookup_output: PathBuf,
     /// Column name containing the TinyURL/BBO URL
     pub url_column: String,
     /// Delay between URL requests in milliseconds
@@ -47,12 +54,49 @@ pub struct FetchProgress {
 
 /// Fetch cardplay data from BBO TinyURLs in a CSV file.
 ///
+/// Phase 1: Generate tinyurl lookup file (if it doesn't already exist or needs resume).
+/// Phase 2: Merge lookup data into the output cardplay CSV.
+///
 /// Calls `on_progress` after each row. Return `false` from the callback to cancel.
 /// Returns a summary string on success.
 pub fn fetch_cardplay(
     config: &FetchCardplayConfig,
     mut on_progress: impl FnMut(&FetchProgress) -> bool,
 ) -> Result<String> {
+    let total_rows = count_csv_rows(&config.input)?;
+
+    // Phase 1: Generate tinyurl lookup file
+    let phase1_summary = generate_lookup_file(config, &mut on_progress, total_rows)?;
+
+    // Phase 2: Merge lookup into cardplay CSV
+    merge_lookup_to_cardplay(config)?;
+
+    Ok(phase1_summary)
+}
+
+/// Phase 1: Generate the tinyurl lookup file by resolving URLs and parsing LIN data.
+///
+/// Skips entirely if the lookup file already has the expected row count.
+/// Resumes from where it left off if partially complete.
+fn generate_lookup_file(
+    config: &FetchCardplayConfig,
+    on_progress: &mut impl FnMut(&FetchProgress) -> bool,
+    total_rows: usize,
+) -> Result<String> {
+    // Check if lookup file is already complete
+    let existing_rows = if config.lookup_output.exists() {
+        count_csv_rows(&config.lookup_output)?
+    } else {
+        0
+    };
+
+    if existing_rows >= total_rows {
+        return Ok(format!(
+            "Lookup file already complete ({} rows). Skipped URL resolution.",
+            existing_rows
+        ));
+    }
+
     let csv_data = read_bbo_csv_fixed(&config.input)?;
     let mut reader = ReaderBuilder::new()
         .flexible(true)
@@ -64,33 +108,25 @@ pub fn fetch_cardplay(
         .position(|h| h == config.url_column)
         .ok_or_else(|| anyhow::anyhow!("Column '{}' not found in CSV", config.url_column))?;
 
-    let ref_col_idx = headers.iter().position(|h| h == "Ref #");
-    let cardplay_col_idx = headers.iter().position(|h| h == "Cardplay");
-    let lin_url_col_idx = headers.iter().position(|h| h == "LIN_URL");
-
-    let existing_data: HashMap<String, (String, String)> =
-        if config.resume && config.output.exists() {
-            load_existing_cardplay_data(&config.output)?
-        } else {
-            HashMap::new()
-        };
-
-    let mut output_headers = headers.clone();
-    if cardplay_col_idx.is_none() {
-        output_headers.push_field("Cardplay");
-        output_headers.push_field("LIN_URL");
-    }
-
     let mut resolver =
         UrlResolver::with_config(config.delay_ms, config.batch_size, config.batch_delay_ms);
 
-    let total_rows = count_csv_rows(&config.input)?;
+    // Open lookup file for writing (append if resuming)
+    let resuming = existing_rows > 0;
+    let mut out = if resuming {
+        std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&config.lookup_output)?,
+        )
+    } else {
+        std::io::BufWriter::new(std::fs::File::create(&config.lookup_output)?)
+    };
 
-    let mut writer = csv::WriterBuilder::new()
-        .flexible(true)
-        .from_path(&config.output)
-        .context("Failed to create output CSV")?;
-    writer.write_record(&output_headers)?;
+    if !resuming {
+        use std::io::Write;
+        writeln!(out, "{}", LOOKUP_HEADER)?;
+    }
 
     let mut processed = 0usize;
     let mut skipped = 0usize;
@@ -98,13 +134,28 @@ pub fn fetch_cardplay(
 
     for (row_num, result) in reader.records().enumerate() {
         let record = result.context("Failed to read CSV row")?;
+        let board_id = row_num + 1;
         processed += 1;
 
-        let ref_id = ref_col_idx
-            .and_then(|i| record.get(i))
-            .unwrap_or("")
-            .to_string();
-        let existing = existing_data.get(&ref_id);
+        // Skip rows already in the lookup file
+        if row_num < existing_rows {
+            skipped += 1;
+            let keep_going = on_progress(&FetchProgress {
+                completed: processed,
+                total: total_rows,
+                errors,
+                skipped,
+            });
+            if !keep_going {
+                use std::io::Write;
+                out.flush()?;
+                return Ok(format!(
+                    "Cancelled after {} of {} rows ({} errors, {} skipped)",
+                    processed, total_rows, errors, skipped
+                ));
+            }
+            continue;
+        }
 
         // Report progress and check for cancellation
         let keep_going = on_progress(&FetchProgress {
@@ -114,23 +165,94 @@ pub fn fetch_cardplay(
             skipped,
         });
         if !keep_going {
-            writer.flush()?;
+            use std::io::Write;
+            out.flush()?;
             return Ok(format!(
                 "Cancelled after {} of {} rows ({} errors, {} skipped)",
                 processed, total_rows, errors, skipped
             ));
         }
 
-        let (cardplay, lin_url) = if let Some((existing_lin, existing_cardplay)) = existing {
-            if !existing_cardplay.is_empty() && !existing_cardplay.starts_with("ERROR:") {
-                skipped += 1;
-                (existing_cardplay.clone(), existing_lin.clone())
-            } else {
-                fetch_cardplay_for_url(&mut resolver, &record, url_col_idx, row_num, &mut errors)
+        let tinyurl = record.get(url_col_idx).unwrap_or("").trim();
+
+        if tinyurl.is_empty() {
+            use std::io::Write;
+            writeln!(out, "{},{},,,,,,,,,,,,,", board_id, tinyurl)?;
+            continue;
+        }
+
+        match resolve_and_parse_url(&mut resolver, tinyurl) {
+            Ok((lin, resolved_url)) => {
+                write_lookup_row(&mut out, board_id, tinyurl, &lin, &resolved_url)?;
             }
-        } else {
-            fetch_cardplay_for_url(&mut resolver, &record, url_col_idx, row_num, &mut errors)
-        };
+            Err(e) => {
+                log::warn!(
+                    "Row {}: Error processing URL '{}': {}",
+                    board_id,
+                    tinyurl,
+                    e
+                );
+                errors += 1;
+
+                if e.to_string().contains("Rate limited") {
+                    log::warn!("Rate limited - pausing for 60 seconds...");
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    resolver.reset_batch();
+                }
+
+                use std::io::Write;
+                writeln!(out, "{},{},,,,,,,,,,,,,", board_id, tinyurl)?;
+            }
+        }
+
+        if processed.is_multiple_of(100) {
+            use std::io::Write;
+            out.flush()?;
+        }
+    }
+
+    use std::io::Write;
+    out.flush()?;
+    Ok(format!(
+        "Done! Processed {} rows ({} errors, {} skipped)",
+        processed, errors, skipped
+    ))
+}
+
+/// Phase 2: Read the lookup file and original CSV, merge Cardplay + LIN_URL into the output.
+fn merge_lookup_to_cardplay(config: &FetchCardplayConfig) -> Result<()> {
+    // Load lookup data: Board_ID (1-based index) → (Cardplay, LIN_URL)
+    let lookup = load_lookup_data(&config.lookup_output)?;
+
+    let csv_data = read_bbo_csv_fixed(&config.input)?;
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_data.as_bytes());
+    let headers = reader.headers()?.clone();
+
+    let cardplay_col_idx = headers.iter().position(|h| h == "Cardplay");
+    let lin_url_col_idx = headers.iter().position(|h| h == "LIN_URL");
+
+    let mut output_headers = headers.clone();
+    if cardplay_col_idx.is_none() {
+        output_headers.push_field("Cardplay");
+        output_headers.push_field("LIN_URL");
+    }
+
+    let mut writer = csv::WriterBuilder::new()
+        .flexible(true)
+        .from_path(&config.output)
+        .context("Failed to create output CSV")?;
+    writer.write_record(&output_headers)?;
+
+    for (row_num, result) in reader.records().enumerate() {
+        let record = result.context("Failed to read CSV row")?;
+        let board_id = row_num + 1;
+
+        let (cardplay, lin_url) = lookup
+            .get(&board_id)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new()));
 
         let mut output_record: Vec<String> = record.iter().map(|s| s.to_string()).collect();
 
@@ -146,21 +268,14 @@ pub fn fetch_cardplay(
             output_record.push(lin_url);
         }
         writer.write_record(&output_record)?;
-
-        if processed.is_multiple_of(100) {
-            writer.flush()?;
-        }
     }
 
     writer.flush()?;
-    Ok(format!(
-        "Done! Processed {} rows ({} errors, {} skipped)",
-        processed, errors, skipped
-    ))
+    Ok(())
 }
 
-/// Resolve a URL and parse its LIN data, returning (cardplay, resolved_url).
-fn process_url(resolver: &mut UrlResolver, url: &str) -> Result<(String, String)> {
+/// Resolve a URL (following tinyurl/bit.ly redirects) and parse its LIN data.
+fn resolve_and_parse_url(resolver: &mut UrlResolver, url: &str) -> Result<(LinData, String)> {
     let resolved_url = if url.contains("tinyurl.com") || url.contains("bit.ly") {
         resolver.resolve(url)?
     } else {
@@ -168,70 +283,84 @@ fn process_url(resolver: &mut UrlResolver, url: &str) -> Result<(String, String)
     };
 
     let lin_data = parse_lin_from_url(&resolved_url)?;
-    let cardplay = lin_data.format_cardplay_by_trick();
-
-    Ok((cardplay, resolved_url))
+    Ok((lin_data, resolved_url))
 }
 
-/// Fetch cardplay for a single URL, handling errors gracefully.
-fn fetch_cardplay_for_url(
-    resolver: &mut UrlResolver,
-    record: &csv::StringRecord,
-    url_col_idx: usize,
-    row_num: usize,
-    errors: &mut usize,
-) -> (String, String) {
-    let url = record.get(url_col_idx).unwrap_or("").trim();
-
-    if url.is_empty() {
-        return (String::new(), String::new());
-    }
-
-    match process_url(resolver, url) {
-        Ok((cp, lu)) => (cp, lu),
-        Err(e) => {
-            log::warn!("Row {}: Error processing URL '{}': {}", row_num + 1, url, e);
-            *errors += 1;
-
-            if e.to_string().contains("Rate limited") {
-                log::warn!("Rate limited - pausing for 60 seconds...");
-                std::thread::sleep(std::time::Duration::from_secs(60));
-                resolver.reset_batch();
-            }
-
-            (format!("ERROR: {}", e), String::new())
-        }
-    }
-}
-
-/// Load existing cardplay data from an output file for resume support.
-fn load_existing_cardplay_data(output: &Path) -> Result<HashMap<String, (String, String)>> {
+/// Load lookup data from the tinyurl lookup file.
+///
+/// Returns a map of Board_ID → (Cardplay, LIN_URL).
+fn load_lookup_data(lookup_path: &Path) -> Result<HashMap<usize, (String, String)>> {
     let mut data = HashMap::new();
-    let mut reader = ReaderBuilder::new().flexible(true).from_path(output)?;
+    let csv_data = read_bbo_csv_fixed(lookup_path)?;
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_data.as_bytes());
 
     let headers = reader.headers()?.clone();
-    let ref_idx = headers.iter().position(|h| h == "Ref #");
-    let lin_url_idx = headers.iter().position(|h| h == "LIN_URL");
-    let cardplay_idx = headers.iter().position(|h| h == "Cardplay");
-
-    if ref_idx.is_none() || cardplay_idx.is_none() {
-        return Ok(data);
-    }
-
-    let ref_idx = ref_idx.unwrap();
-    let cardplay_idx = cardplay_idx.unwrap();
+    let board_id_idx = headers
+        .iter()
+        .position(|h| h == "Board_ID")
+        .context("Board_ID column not found in lookup file")?;
+    let cardplay_idx = headers
+        .iter()
+        .position(|h| h == "Cardplay")
+        .context("Cardplay column not found in lookup file")?;
+    let lin_url_idx = headers
+        .iter()
+        .position(|h| h == "LIN_URL")
+        .context("LIN_URL column not found in lookup file")?;
 
     for result in reader.records() {
         let record = result?;
-        let ref_id = record.get(ref_idx).unwrap_or("").to_string();
-        let lin_url = lin_url_idx
-            .and_then(|i| record.get(i))
-            .unwrap_or("")
-            .to_string();
-        let cardplay = record.get(cardplay_idx).unwrap_or("").to_string();
+        let board_id: usize = record
+            .get(board_id_idx)
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        let cardplay = record.get(cardplay_idx).unwrap_or("").trim().to_string();
+        let lin_url = record.get(lin_url_idx).unwrap_or("").trim().to_string();
 
-        if !ref_id.is_empty() {
-            data.insert(ref_id, (lin_url, cardplay));
+        if board_id > 0 {
+            data.insert(board_id, (cardplay, lin_url));
+        }
+    }
+
+    Ok(data)
+}
+
+/// Load tinyurl → (Board_ID, LIN_URL) mapping from lookup file.
+///
+/// Used during anonymization to replace tinyurls with Board IDs.
+pub fn load_lookup_board_ids(lookup_path: &Path) -> Result<HashMap<String, (String, String)>> {
+    let mut data = HashMap::new();
+    let csv_data = read_bbo_csv_fixed(lookup_path)?;
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_data.as_bytes());
+
+    let headers = reader.headers()?.clone();
+    let board_id_idx = headers
+        .iter()
+        .position(|h| h == "Board_ID")
+        .context("Board_ID column not found in lookup file")?;
+    let tinyurl_idx = headers
+        .iter()
+        .position(|h| h == "TinyURL")
+        .context("TinyURL column not found in lookup file")?;
+    let lin_url_idx = headers
+        .iter()
+        .position(|h| h == "LIN_URL")
+        .context("LIN_URL column not found in lookup file")?;
+
+    for result in reader.records() {
+        let record = result?;
+        let board_id = record.get(board_id_idx).unwrap_or("").trim().to_string();
+        let tinyurl = record.get(tinyurl_idx).unwrap_or("").trim();
+        let lin_url = record.get(lin_url_idx).unwrap_or("").trim().to_string();
+
+        if !board_id.is_empty() && !tinyurl.is_empty() {
+            data.insert(normalize_tinyurl(tinyurl), (board_id, lin_url));
         }
     }
 
@@ -845,6 +974,9 @@ pub struct AnonymizeResult {
     pub summary: String,
     /// All name mappings (original lowercase -> replacement), sorted longest-first.
     pub name_mappings: Vec<(String, String)>,
+    /// Subject-only mappings (from explicit map), sorted longest-first.
+    /// Use for hotspot reports which only contain the 2 subject players.
+    pub subject_mappings: Vec<(String, String)>,
     /// URL mappings (normalized tinyurl key -> anonymized full handviewer URL).
     pub url_mappings: HashMap<String, String>,
 }
@@ -864,7 +996,15 @@ pub struct AnonymizeConfig {
 }
 
 /// Run anonymize and return a result with summary and name mappings.
-pub fn anonymize_csv(config: &AnonymizeConfig) -> Result<AnonymizeResult> {
+///
+/// When `board_id_map` is non-empty, the BBO column is replaced with Board_IDs
+/// from the tinyurl lookup file. Calls `on_progress` after each row.
+pub fn anonymize_csv(
+    config: &AnonymizeConfig,
+    board_id_map: &HashMap<String, (String, String)>,
+    total_rows: usize,
+    on_progress: &mut impl FnMut(&AnonProgress) -> bool,
+) -> Result<AnonymizeResult> {
     if config.key.is_empty() {
         return Err(anyhow::anyhow!("Anonymization key is required"));
     }
@@ -910,6 +1050,14 @@ pub fn anonymize_csv(config: &AnonymizeConfig) -> Result<AnonymizeResult> {
                 output_fields.push(anonymizer.anonymize(field));
             } else if Some(i) == lin_url_idx && !field.is_empty() {
                 output_fields.push(anonymize_lin_url(field, &mut anonymizer));
+            } else if Some(i) == bbo_col_idx && !field.is_empty() && !board_id_map.is_empty() {
+                // Replace tinyurl with Board_ID
+                let key = normalize_tinyurl(field);
+                if let Some((board_id, _)) = board_id_map.get(&key) {
+                    output_fields.push(board_id.clone());
+                } else {
+                    output_fields.push(field.to_string());
+                }
             } else {
                 output_fields.push(field.to_string());
             }
@@ -927,6 +1075,22 @@ pub fn anonymize_csv(config: &AnonymizeConfig) -> Result<AnonymizeResult> {
         }
 
         writer.write_record(&output_fields)?;
+
+        if processed.is_multiple_of(500) || processed as usize == total_rows {
+            let keep_going = on_progress(&AnonProgress {
+                completed: processed as usize,
+                total: total_rows,
+                phase: "Anonymizing CSV...",
+            });
+            if !keep_going {
+                writer.flush()?;
+                return Err(anyhow::anyhow!(
+                    "Cancelled after {} of {} rows",
+                    processed,
+                    total_rows
+                ));
+            }
+        }
     }
 
     writer.flush()?;
@@ -940,6 +1104,14 @@ pub fn anonymize_csv(config: &AnonymizeConfig) -> Result<AnonymizeResult> {
         .collect();
     name_mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+    // Subject-only mappings (explicit maps) for hotspot reports
+    let mut subject_mappings: Vec<(String, String)> = anonymizer
+        .explicit_maps
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    subject_mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
     Ok(AnonymizeResult {
         summary: format!(
             "Anonymization complete:\n  Rows processed: {}\n  Explicit mappings: {}\n  Generated names: {}\n  Total unique names: {}",
@@ -949,72 +1121,143 @@ pub fn anonymize_csv(config: &AnonymizeConfig) -> Result<AnonymizeResult> {
             anonymizer.used_names.len()
         ),
         name_mappings,
+        subject_mappings,
         url_mappings,
     })
 }
 
 /// Anonymize player names in a text file using pre-built name mappings.
 ///
-/// Performs column-aware, case-insensitive replacement: when a name is followed
-/// by whitespace (spaces or tabs), the space count is adjusted so that the
-/// character position after the whitespace is preserved. Also replaces tinyurls
-/// with full anonymized handviewer URLs when `url_mappings` is non-empty.
+/// Performs case-insensitive replacement with column-aware spacing: when a name
+/// is followed by whitespace, the space count is adjusted so that column
+/// alignment is preserved. Uses simple string matching (no regex).
+///
+/// When `board_id_map` is non-empty (hotspot reports), tinyurls are replaced
+/// with Board_IDs and the anonymized LIN_URL (from `url_mappings`) is appended
+/// at the end of each matching line.
 pub fn anonymize_text_file(
     input: &Path,
     output: &Path,
     name_mappings: &[(String, String)],
     url_mappings: &HashMap<String, String>,
+    board_id_map: &HashMap<String, (String, String)>,
 ) -> Result<()> {
     let content = std::fs::read_to_string(input)
         .with_context(|| format!("Failed to read text file: {}", input.display()))?;
+    let had_trailing_newline = content.ends_with('\n');
 
-    let mut result = content;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
-    // Column-aware name replacement (longest names first, already sorted)
-    for (original, replacement) in name_mappings {
-        // First pass: replace name followed by whitespace, adjusting space count
-        let col_pattern =
-            regex::RegexBuilder::new(&format!("{}([ \\t]+)", regex::escape(original)))
-                .case_insensitive(true)
-                .build()
-                .with_context(|| format!("Failed to build column regex for '{}'", original))?;
+    // Column-aware name replacement: process ALL names on each line in a single
+    // pass so that column debt from one replacement (e.g. "adwilliams" -> "Bob"
+    // inside "adwilliams-spwilliams") carries forward to the next whitespace gap.
+    let name_lowers: Vec<(String, usize, &str)> = name_mappings
+        .iter()
+        .map(|(orig, repl)| (orig.to_lowercase(), orig.len(), repl.as_str()))
+        .collect();
 
-        let orig_len = original.len();
-        let repl_len = replacement.len();
-        let repl = replacement.clone();
-        result = col_pattern
-            .replace_all(&result, |caps: &regex::Captures| -> String {
-                let ws = caps.get(1).unwrap().as_str();
-                let new_spaces = (ws.len() + orig_len).saturating_sub(repl_len).max(1);
-                format!("{}{}", repl, " ".repeat(new_spaces))
-            })
-            .to_string();
+    for line in &mut lines {
+        let line_lower = line.to_lowercase();
 
-        // Second pass: replace remaining (non-column) occurrences — name at
-        // end of line, adjacent to punctuation, etc.
-        let pattern = regex::RegexBuilder::new(&regex::escape(original))
-            .case_insensitive(true)
-            .build()
-            .with_context(|| format!("Failed to build regex for '{}'", original))?;
-        result = pattern
-            .replace_all(&result, replacement.as_str())
-            .to_string();
+        // Find all name matches on this line
+        let mut matches: Vec<(usize, usize, &str)> = Vec::new(); // (start, orig_len, replacement)
+        for (orig_lower, orig_len, replacement) in &name_lowers {
+            let mut start = 0;
+            while let Some(pos) = line_lower[start..].find(orig_lower.as_str()) {
+                matches.push((start + pos, *orig_len, replacement));
+                start += pos + orig_len;
+            }
+        }
+
+        if matches.is_empty() {
+            continue;
+        }
+
+        // Sort by position; for same position, prefer longest match
+        matches.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+        // Remove overlapping matches (keep earliest/longest)
+        let mut filtered: Vec<(usize, usize, &str)> = Vec::new();
+        for m in matches {
+            if let Some(last) = filtered.last() {
+                if m.0 < last.0 + last.1 {
+                    continue;
+                }
+            }
+            filtered.push(m);
+        }
+
+        // Build result with cumulative column debt tracking
+        let mut result = String::with_capacity(line.len());
+        let mut pos = 0;
+        let mut col_debt: isize = 0;
+
+        for (match_start, orig_len, replacement) in &filtered {
+            // Copy text between previous position and this match
+            result.push_str(&line[pos..*match_start]);
+            result.push_str(replacement);
+            col_debt += *orig_len as isize - replacement.len() as isize;
+
+            let after_name = match_start + orig_len;
+            if after_name < line.len() {
+                let remaining = &line[after_name..];
+                let ws_len = remaining.len() - remaining.trim_start().len();
+                if ws_len > 0 {
+                    // Absorb accumulated column debt into this whitespace gap
+                    let new_ws = (ws_len as isize + col_debt).max(1) as usize;
+                    result.push_str(&" ".repeat(new_ws));
+                    col_debt = 0;
+                    pos = after_name + ws_len;
+                } else {
+                    pos = after_name;
+                }
+            } else {
+                pos = after_name;
+            }
+        }
+
+        result.push_str(&line[pos..]);
+        *line = result;
     }
 
-    // Replace tinyurls with full anonymized handviewer URLs
-    if !url_mappings.is_empty() {
-        let url_pattern = regex::Regex::new(r"https?://(?:tinyurl\.com|bit\.ly)/\S+")
-            .context("Failed to build tinyurl regex")?;
-        result = url_pattern
-            .replace_all(&result, |caps: &regex::Captures| -> String {
-                let url = &caps[0];
+    // Tinyurl replacement: replace with Board_ID, append anonymized LIN_URL
+    if !board_id_map.is_empty() {
+        let url_prefixes = [
+            "http://tinyurl.com/",
+            "https://tinyurl.com/",
+            "http://bit.ly/",
+            "https://bit.ly/",
+        ];
+        for line in &mut lines {
+            let url_start = url_prefixes
+                .iter()
+                .filter_map(|prefix| line.find(prefix))
+                .min();
+            if let Some(start) = url_start {
+                let url_end = line[start..]
+                    .find(char::is_whitespace)
+                    .map(|p| start + p)
+                    .unwrap_or(line.len());
+                let url = &line[start..url_end];
                 let key = normalize_tinyurl(url);
-                match url_mappings.get(&key) {
-                    Some(full_url) => full_url.clone(),
-                    None => "[URL redacted]".to_string(),
+                let board_id = board_id_map
+                    .get(&key)
+                    .map(|(id, _)| id.as_str())
+                    .unwrap_or("[unknown]");
+                let anon_lin = url_mappings.get(&key).map(|s| s.as_str()).unwrap_or("");
+                let mut new_line = format!("{}{}{}", &line[..start], board_id, &line[url_end..]);
+                if !anon_lin.is_empty() {
+                    new_line.push(' ');
+                    new_line.push_str(anon_lin);
                 }
-            })
-            .to_string();
+                *line = new_line;
+            }
+        }
+    }
+
+    let mut result = lines.join("\n");
+    if had_trailing_newline && !result.ends_with('\n') {
+        result.push('\n');
     }
 
     std::fs::write(output, &result)
@@ -1044,10 +1287,33 @@ pub struct AnonymizeAllConfig {
     pub hotspot_output: Option<PathBuf>,
 }
 
+/// Progress information for the anonymize operation.
+pub struct AnonProgress {
+    /// Number of CSV rows completed so far
+    pub completed: usize,
+    /// Total number of CSV rows to process
+    pub total: usize,
+    /// Current phase description
+    pub phase: &'static str,
+}
+
 /// Run full anonymization: CSV first (to build mappings), then text files.
 ///
-/// Returns a summary string describing all operations performed.
-pub fn anonymize_all(config: &AnonymizeAllConfig) -> Result<String> {
+/// Calls `on_progress` after each CSV row. Returns a summary string.
+pub fn anonymize_all(
+    config: &AnonymizeAllConfig,
+    mut on_progress: impl FnMut(&AnonProgress) -> bool,
+) -> Result<String> {
+    // Load tinyurl → Board_ID mapping from lookup file if available
+    let lookup_path = derive_lookup_path(&config.csv_input);
+    let board_id_map = if lookup_path.exists() {
+        load_lookup_board_ids(&lookup_path)?
+    } else {
+        HashMap::new()
+    };
+
+    let total_rows = count_csv_rows(&config.csv_input)?;
+
     let csv_config = AnonymizeConfig {
         input: config.csv_input.clone(),
         output: config.csv_output.clone(),
@@ -1055,31 +1321,43 @@ pub fn anonymize_all(config: &AnonymizeAllConfig) -> Result<String> {
         map: config.map.clone(),
         columns: config.columns.clone(),
     };
-    let csv_result = anonymize_csv(&csv_config)?;
+    let csv_result = anonymize_csv(&csv_config, &board_id_map, total_rows, &mut on_progress)?;
 
-    let mut summary = csv_result.summary.clone();
+    let summary = csv_result.summary.clone();
 
     let empty_urls = HashMap::new();
+    let empty_board_ids: HashMap<String, (String, String)> = HashMap::new();
 
     if let (Some(input), Some(output)) = (&config.concise_input, &config.concise_output) {
-        anonymize_text_file(input, output, &csv_result.name_mappings, &empty_urls)?;
-        summary.push_str(&format!(
-            "\n  Concise report: {}",
-            output.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-
-    if let (Some(input), Some(output)) = (&config.hotspot_input, &config.hotspot_output) {
+        on_progress(&AnonProgress {
+            completed: total_rows,
+            total: total_rows,
+            phase: "Processing concise report...",
+        });
         anonymize_text_file(
             input,
             output,
             &csv_result.name_mappings,
-            &csv_result.url_mappings,
+            &empty_urls,
+            &empty_board_ids,
         )?;
-        summary.push_str(&format!(
-            "\n  Hotspot report: {}",
-            output.file_name().unwrap_or_default().to_string_lossy()
-        ));
+    }
+
+    if let (Some(input), Some(output)) = (&config.hotspot_input, &config.hotspot_output) {
+        on_progress(&AnonProgress {
+            completed: total_rows,
+            total: total_rows,
+            phase: "Processing hotspot report...",
+        });
+        // Hotspot reports only contain the 2 subject players — use subject_mappings
+        // to avoid spurious matches (e.g. player named "None" replacing "Vul: None")
+        anonymize_text_file(
+            input,
+            output,
+            &csv_result.subject_mappings,
+            &csv_result.url_mappings,
+            &board_id_map,
+        )?;
     }
 
     Ok(summary)
@@ -1246,6 +1524,112 @@ pub fn truncate_csv(input: &Path, first_n: usize) -> Result<std::path::PathBuf> 
     writer.flush()?;
     Ok(temp_path)
 }
+
+// ============================================================================
+// Lookup File Helpers
+// ============================================================================
+
+/// Derive the tinyurl lookup file path from a cardplay output path.
+///
+/// Replaces "cardplay" with "tinyurl lookup" in the filename.
+/// e.g., "AWilliams cardplay.csv" → "AWilliams tinyurl lookup.csv"
+pub fn derive_lookup_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let new_stem = stem.replace("cardplay", "tinyurl lookup");
+    let ext = output
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    output.with_file_name(format!("{}.{}", new_stem, ext))
+}
+
+/// Format the auction as a human-readable string (e.g., "1C-p-1H-2S").
+fn format_auction(lin: &LinData) -> String {
+    lin.auction
+        .iter()
+        .map(|b| {
+            let mut s = b.bid.clone();
+            if b.alert {
+                s.push('!');
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Format explanations as pipe-separated bid=annotation pairs.
+///
+/// e.g., "2C=capp+transfer+to+diam|3H=sp"
+fn format_explanations(lin: &LinData) -> String {
+    lin.auction
+        .iter()
+        .filter_map(|b| {
+            b.annotation.as_ref().map(|ann| {
+                let encoded = ann.replace(' ', "+");
+                format!("{}={}", b.bid, encoded)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Format vulnerability as a short string.
+fn format_vulnerability(v: &Vulnerability) -> &'static str {
+    match v {
+        Vulnerability::None => "None",
+        Vulnerability::NorthSouth => "NS",
+        Vulnerability::EastWest => "EW",
+        Vulnerability::Both => "Both",
+    }
+}
+
+/// Write a single lookup row from parsed LIN data.
+fn write_lookup_row(
+    out: &mut impl std::io::Write,
+    board_id: usize,
+    tinyurl: &str,
+    lin: &LinData,
+    lin_url: &str,
+) -> Result<()> {
+    let board_header = lin.board_header.as_deref().unwrap_or("");
+    let cardplay = lin.format_cardplay_by_trick();
+    let claim = lin.claim.map(|c| c.to_string()).unwrap_or_default();
+    let deal_pbn = lin.deal.to_pbn(Direction::North);
+    let auction = format_auction(lin);
+    let explanations = format_explanations(lin);
+    let vulnerability = format_vulnerability(&lin.vulnerability);
+
+    writeln!(
+        out,
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        board_id,
+        tinyurl,
+        board_header,
+        lin.player_names[0], // S
+        lin.player_names[1], // W
+        lin.player_names[2], // N
+        lin.player_names[3], // E
+        format_args!("{:?}", lin.dealer),
+        vulnerability,
+        deal_pbn,
+        auction,
+        explanations,
+        cardplay,
+        claim,
+        lin_url,
+    )?;
+    Ok(())
+}
+
+/// The header line for the tinyurl lookup CSV.
+const LOOKUP_HEADER: &str = "Board_ID,TinyURL,Board_Header,Player_S,Player_W,Player_N,Player_E,\
+                              Dealer,Vulnerability,Deal_PBN,Auction,Explanations,Cardplay,Claim,LIN_URL";
 
 // ============================================================================
 // Internal Helpers
@@ -1899,10 +2283,938 @@ fn anonymize_lin_url(url: &str, anonymizer: &mut Anonymizer) -> String {
 }
 
 // ============================================================================
-// Package Workbook
+// Analyze DD
 // ============================================================================
 
-use std::path::PathBuf;
+/// Configuration for the DD analysis operation.
+pub struct AnalyzeDdConfig {
+    /// Input CSV path (must have Cardplay column and deal columns)
+    pub input: PathBuf,
+    /// Output CSV path
+    pub output: PathBuf,
+    /// Number of parallel threads (None = number of CPU cores)
+    pub threads: Option<usize>,
+    /// Resume from previous run (skip rows with existing DD analysis)
+    pub resume: bool,
+    /// Save progress every N rows
+    pub checkpoint_interval: usize,
+}
+
+/// Progress information for the DD analysis operation.
+pub struct DdProgress {
+    /// Number of rows completed so far
+    pub completed: usize,
+    /// Total number of rows to process
+    pub total: usize,
+    /// Number of errors encountered
+    pub errors: usize,
+    /// Number of rows skipped (already processed in resume mode)
+    pub skipped: usize,
+}
+
+/// Represents a row to be processed for DD analysis.
+#[derive(Clone)]
+struct DdWorkItem {
+    row_idx: usize,
+    #[allow(dead_code)]
+    ref_id: String,
+    deal_pbn: String,
+    cardplay: String,
+    contract: String,
+    declarer: String,
+    max_dd: Option<i8>,
+}
+
+/// Result stored for each processed row.
+struct DdResultEntry {
+    analysis: String,
+    computed_dd: Option<u8>,
+    input_max_dd: Option<i8>,
+    ol_error: u8,
+    plays_n: u8,
+    plays_s: u8,
+    plays_e: u8,
+    plays_w: u8,
+    errors_n: u8,
+    errors_s: u8,
+    errors_e: u8,
+    errors_w: u8,
+}
+
+/// Result from DD analysis including validation info.
+struct DdAnalysisOutput {
+    analysis: String,
+    initial_dd: u8,
+    ol_error: u8,
+    plays_n: u8,
+    plays_s: u8,
+    plays_e: u8,
+    plays_w: u8,
+    errors_n: u8,
+    errors_s: u8,
+    errors_e: u8,
+    errors_w: u8,
+}
+
+/// Column indices for required fields in the CSV.
+struct DdColumnIndices {
+    ref_col: usize,
+    cardplay_col: usize,
+    contract_col: usize,
+    declarer_col: usize,
+    max_dd_col: Option<usize>,
+    dec_hand_col: usize,
+    dummy_hand_col: usize,
+    leader_hand_col: usize,
+    third_hand_col: usize,
+}
+
+/// Data extracted from a row for DD analysis.
+struct DdRowData {
+    deal_pbn: String,
+    contract: String,
+    declarer: String,
+}
+
+/// Run double-dummy analysis on a CSV of cardplay data.
+///
+/// Calls `on_progress` periodically (~10 times/second). Return `false` to cancel.
+pub fn analyze_dd(
+    config: &AnalyzeDdConfig,
+    on_progress: impl FnMut(&DdProgress) -> bool + Send,
+) -> Result<String> {
+    // Configure thread pool
+    if let Some(n) = config.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .ok();
+    }
+
+    // Read input CSV with flexible field count
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_path(&config.input)
+        .context("Failed to open input CSV")?;
+    let headers = reader.headers()?.clone();
+
+    let col_indices = dd_find_required_columns(&headers)?;
+    let dd_col_exists = headers.iter().any(|h| h == "DD_Analysis");
+
+    // Load existing results if resuming
+    let existing_refs: HashSet<String> = if config.resume && config.output.exists() {
+        dd_load_existing_refs(&config.output, "DD_Analysis")?
+    } else {
+        HashSet::new()
+    };
+
+    // Prepare output headers
+    let mut output_headers = headers.clone();
+    if !dd_col_exists {
+        output_headers.push_field("Contract_DD");
+        output_headers.push_field("DD_Match");
+        output_headers.push_field("DD_OL_Error");
+        output_headers.push_field("DD_N_Plays");
+        output_headers.push_field("DD_S_Plays");
+        output_headers.push_field("DD_E_Plays");
+        output_headers.push_field("DD_W_Plays");
+        output_headers.push_field("DD_N_Errors");
+        output_headers.push_field("DD_S_Errors");
+        output_headers.push_field("DD_E_Errors");
+        output_headers.push_field("DD_W_Errors");
+        output_headers.push_field("DD_Analysis");
+    }
+
+    // Collect all rows and prepare work items
+    let mut all_records: Vec<StringRecord> = Vec::new();
+    let mut work_items: Vec<DdWorkItem> = Vec::new();
+    let mut skipped_incomplete = 0usize;
+    let mut skipped_passout = 0usize;
+    let mut skipped_resume = 0usize;
+
+    for (row_idx, result) in reader.records().enumerate() {
+        let record = result.context("Failed to read CSV row")?;
+        all_records.push(record.clone());
+
+        let ref_id = record.get(col_indices.ref_col).unwrap_or("").to_string();
+
+        if config.resume && existing_refs.contains(&ref_id) {
+            skipped_resume += 1;
+            continue;
+        }
+
+        let max_dd: Option<i8> = col_indices
+            .max_dd_col
+            .and_then(|col| record.get(col))
+            .and_then(|s| s.parse::<i8>().ok());
+
+        if max_dd == Some(-1) {
+            skipped_incomplete += 1;
+            continue;
+        }
+
+        let cardplay = record
+            .get(col_indices.cardplay_col)
+            .unwrap_or("")
+            .to_string();
+
+        if cardplay.is_empty() || cardplay.starts_with("ERROR:") {
+            continue;
+        }
+
+        if let Some(row_data) = dd_extract_row_data(&record, &col_indices) {
+            let contract_upper = row_data.contract.to_uppercase();
+            if contract_upper.starts_with('0') || contract_upper == "P" || contract_upper == "PASS"
+            {
+                skipped_passout += 1;
+                continue;
+            }
+
+            work_items.push(DdWorkItem {
+                row_idx,
+                ref_id,
+                deal_pbn: row_data.deal_pbn,
+                cardplay,
+                contract: row_data.contract,
+                declarer: row_data.declarer,
+                max_dd,
+            });
+        }
+    }
+
+    let total_rows = all_records.len();
+    let to_process = work_items.len();
+    let skipped_no_work = total_rows - to_process - skipped_resume;
+
+    if to_process == 0 {
+        return Ok(format!(
+            "Nothing to process ({} rows, {} already done, {} incomplete, {} passout)",
+            total_rows, skipped_resume, skipped_incomplete, skipped_passout
+        ));
+    }
+
+    // Shared atomics for progress
+    let processed_count = AtomicUsize::new(0);
+    let error_count = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+
+    // Results map
+    let results: Mutex<HashMap<usize, DdResultEntry>> = Mutex::new(HashMap::new());
+
+    // Run monitor thread + parallel processing within a scope.
+    // std::thread::scope automatically joins all spawned threads on exit.
+    std::thread::scope(|s| {
+        let processed_ref = &processed_count;
+        let error_ref = &error_count;
+        let cancelled_ref = &cancelled;
+        let done_ref = &done;
+
+        s.spawn(move || {
+            let mut on_progress = on_progress;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let completed = processed_ref.load(Ordering::Relaxed);
+                let errors = error_ref.load(Ordering::Relaxed);
+                let progress = DdProgress {
+                    completed: completed + skipped_no_work,
+                    total: total_rows,
+                    errors,
+                    skipped: skipped_resume,
+                };
+                if !on_progress(&progress) {
+                    cancelled_ref.store(true, Ordering::Relaxed);
+                }
+                if done_ref.load(Ordering::Relaxed) {
+                    // Send final progress update
+                    let completed = processed_ref.load(Ordering::Relaxed);
+                    let errors = error_ref.load(Ordering::Relaxed);
+                    let _ = on_progress(&DdProgress {
+                        completed: completed + skipped_no_work,
+                        total: total_rows,
+                        errors,
+                        skipped: skipped_resume,
+                    });
+                    break;
+                }
+            }
+        });
+
+        // Process work items in parallel.
+        // Wrap each call in catch_unwind so bridge-solver panics don't kill
+        // rayon threads and stall the entire analysis.
+        work_items.par_iter().for_each(|item| {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let entry = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dd_compute_analysis(item)
+            })) {
+                Ok(Ok(output)) => DdResultEntry {
+                    analysis: output.analysis,
+                    computed_dd: Some(output.initial_dd),
+                    input_max_dd: item.max_dd,
+                    ol_error: output.ol_error,
+                    plays_n: output.plays_n,
+                    plays_s: output.plays_s,
+                    plays_e: output.plays_e,
+                    plays_w: output.plays_w,
+                    errors_n: output.errors_n,
+                    errors_s: output.errors_s,
+                    errors_e: output.errors_e,
+                    errors_w: output.errors_w,
+                },
+                Ok(Err(e)) => {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("Row {}: DD analysis error: {}", item.row_idx + 1, e);
+                    DdResultEntry {
+                        analysis: format!("ERROR: {}", e),
+                        computed_dd: None,
+                        input_max_dd: item.max_dd,
+                        ol_error: 0,
+                        plays_n: 0,
+                        plays_s: 0,
+                        plays_e: 0,
+                        plays_w: 0,
+                        errors_n: 0,
+                        errors_s: 0,
+                        errors_e: 0,
+                        errors_w: 0,
+                    }
+                }
+                Err(panic_info) => {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    log::warn!("Row {}: DD solver panic: {}", item.row_idx + 1, msg);
+                    DdResultEntry {
+                        analysis: format!("PANIC: {}", msg),
+                        computed_dd: None,
+                        input_max_dd: item.max_dd,
+                        ol_error: 0,
+                        plays_n: 0,
+                        plays_s: 0,
+                        plays_e: 0,
+                        plays_w: 0,
+                        errors_n: 0,
+                        errors_s: 0,
+                        errors_e: 0,
+                        errors_w: 0,
+                    }
+                }
+            };
+
+            results.lock().unwrap().insert(item.row_idx, entry);
+            processed_count.fetch_add(1, Ordering::Relaxed);
+        });
+
+        done.store(true, Ordering::Relaxed);
+    });
+
+    let was_cancelled = cancelled.load(Ordering::Relaxed);
+
+    // Write output CSV
+    let results_map = results.into_inner().unwrap();
+    let mut writer = Writer::from_path(&config.output).context("Failed to create output CSV")?;
+    writer.write_record(&output_headers)?;
+
+    let mut dd_matches = 0usize;
+    let mut dd_mismatches: Vec<(usize, u8, i8)> = Vec::new();
+
+    for (row_idx, record) in all_records.iter().enumerate() {
+        let mut output_record = record.clone();
+
+        if !dd_col_exists {
+            if let Some(entry) = results_map.get(&row_idx) {
+                output_record
+                    .push_field(&entry.computed_dd.map(|d| d.to_string()).unwrap_or_default());
+                let dd_match = match (entry.computed_dd, entry.input_max_dd) {
+                    (Some(computed), Some(input)) if input >= 0 => {
+                        if computed as i8 == input {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    }
+                    _ => "",
+                };
+                output_record.push_field(dd_match);
+                output_record.push_field(&entry.ol_error.to_string());
+                output_record.push_field(&entry.plays_n.to_string());
+                output_record.push_field(&entry.plays_s.to_string());
+                output_record.push_field(&entry.plays_e.to_string());
+                output_record.push_field(&entry.plays_w.to_string());
+                output_record.push_field(&entry.errors_n.to_string());
+                output_record.push_field(&entry.errors_s.to_string());
+                output_record.push_field(&entry.errors_e.to_string());
+                output_record.push_field(&entry.errors_w.to_string());
+                output_record.push_field(&entry.analysis);
+            } else {
+                for _ in 0..12 {
+                    output_record.push_field("");
+                }
+            }
+        }
+
+        if let Some(entry) = results_map.get(&row_idx) {
+            if let (Some(computed), Some(input_dd)) = (entry.computed_dd, entry.input_max_dd) {
+                if input_dd >= 0 {
+                    if computed as i8 == input_dd {
+                        dd_matches += 1;
+                    } else {
+                        dd_mismatches.push((row_idx + 2, computed, input_dd));
+                    }
+                }
+            }
+        }
+
+        writer.write_record(&output_record)?;
+
+        if (row_idx + 1) % config.checkpoint_interval == 0 {
+            writer.flush()?;
+        }
+    }
+
+    writer.flush()?;
+
+    // Build summary
+    let errors = error_count.load(Ordering::Relaxed);
+    let processed = processed_count.load(Ordering::Relaxed);
+    let mut summary = if was_cancelled {
+        format!(
+            "Cancelled after {} of {} rows ({} errors)",
+            processed, to_process, errors
+        )
+    } else {
+        format!("Analyzed {} rows ({} errors)", to_process, errors)
+    };
+
+    if dd_matches > 0 || !dd_mismatches.is_empty() {
+        write!(
+            summary,
+            "\nDD Validation: {} matches, {} mismatches",
+            dd_matches,
+            dd_mismatches.len()
+        )
+        .ok();
+        for (row, computed, input) in dd_mismatches.iter().take(20) {
+            write!(
+                summary,
+                "\n  Row {}: computed={}, input={}",
+                row, computed, input
+            )
+            .ok();
+        }
+        if dd_mismatches.len() > 20 {
+            write!(summary, "\n  ... and {} more", dd_mismatches.len() - 20).ok();
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Load existing refs from an output CSV for resume mode.
+fn dd_load_existing_refs(output: &Path, column: &str) -> Result<HashSet<String>> {
+    let mut refs = HashSet::new();
+    let mut reader = ReaderBuilder::new().flexible(true).from_path(output)?;
+
+    let headers = reader.headers()?.clone();
+    let ref_idx = headers.iter().position(|h| h == "Ref #");
+    let col_idx = headers.iter().position(|h| h == column);
+
+    if ref_idx.is_none() || col_idx.is_none() {
+        return Ok(refs);
+    }
+
+    let ref_idx = ref_idx.unwrap();
+    let col_idx = col_idx.unwrap();
+
+    for result in reader.records() {
+        let record = result?;
+        let ref_id = record.get(ref_idx).unwrap_or("");
+        let value = record.get(col_idx).unwrap_or("");
+
+        if !value.is_empty() && !value.starts_with("ERROR:") {
+            refs.insert(ref_id.to_string());
+        }
+    }
+
+    Ok(refs)
+}
+
+/// Find required columns in CSV headers for DD analysis.
+fn dd_find_required_columns(headers: &StringRecord) -> Result<DdColumnIndices> {
+    let find = |name: &str| -> Result<usize> {
+        headers
+            .iter()
+            .position(|h| h == name)
+            .ok_or_else(|| anyhow::anyhow!("Required column '{}' not found", name))
+    };
+
+    let find_optional = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
+
+    Ok(DdColumnIndices {
+        ref_col: find("Ref #")?,
+        cardplay_col: find("Cardplay")?,
+        contract_col: find("Con")?,
+        declarer_col: find("Dec")?,
+        max_dd_col: find_optional("Max DD"),
+        dec_hand_col: find("Dec Hand")?,
+        dummy_hand_col: find("Dummy Hand")?,
+        leader_hand_col: find("Leader Hand")?,
+        third_hand_col: find("Third Hand")?,
+    })
+}
+
+/// Extract deal, contract, and declarer from a CSV row.
+///
+/// Maps role-based hand columns (Dec Hand, Dummy Hand, Leader Hand, Third Hand)
+/// to compass positions using the Dec column.
+fn dd_extract_row_data(record: &StringRecord, cols: &DdColumnIndices) -> Option<DdRowData> {
+    let contract = record.get(cols.contract_col)?.to_string();
+    let declarer = record.get(cols.declarer_col)?.to_string();
+
+    if contract.is_empty() || declarer.is_empty() {
+        return None;
+    }
+
+    let dec_hand = record.get(cols.dec_hand_col).unwrap_or("");
+    let dummy_hand = record.get(cols.dummy_hand_col).unwrap_or("");
+    let leader_hand = record.get(cols.leader_hand_col).unwrap_or("");
+    let third_hand = record.get(cols.third_hand_col).unwrap_or("");
+
+    if dec_hand.is_empty() || dummy_hand.is_empty() {
+        return None;
+    }
+
+    // Map role-based hands to compass positions.
+    // Leader = LHO (next clockwise from declarer), Third = RHO (leader's partner).
+    //   Dec=N: N=Dec, E=Leader, S=Dummy, W=Third
+    //   Dec=E: N=Third, E=Dec, S=Leader, W=Dummy
+    //   Dec=S: N=Dummy, E=Third, S=Dec, W=Leader
+    //   Dec=W: N=Leader, E=Dummy, S=Third, W=Dec
+    let (north, east, south, west) = match declarer.to_uppercase().as_str() {
+        "N" => (dec_hand, leader_hand, dummy_hand, third_hand),
+        "E" => (third_hand, dec_hand, leader_hand, dummy_hand),
+        "S" => (dummy_hand, third_hand, dec_hand, leader_hand),
+        "W" => (leader_hand, dummy_hand, third_hand, dec_hand),
+        _ => return None,
+    };
+
+    // Convert BBO hand format (S-K8543 H-873 D-Q75 C-K3) to PBN (K8543.873.Q75.K3)
+    let n = bbo_hand_to_pbn(north)?;
+    let e = bbo_hand_to_pbn(east)?;
+    let s = bbo_hand_to_pbn(south)?;
+    let w = bbo_hand_to_pbn(west)?;
+
+    let deal_pbn = format!("N:{} {} {} {}", n, e, s, w);
+
+    Some(DdRowData {
+        deal_pbn,
+        contract,
+        declarer,
+    })
+}
+
+/// Convert a BBO-format hand (`S-K8543 H-873 D-Q75 C-K3`) to PBN (`K8543.873.Q75.K3`).
+///
+/// Suits must appear in S, H, D, C order. Returns None if the format is unexpected.
+fn bbo_hand_to_pbn(hand: &str) -> Option<String> {
+    let mut suits: Vec<&str> = Vec::with_capacity(4);
+    for part in hand.split_whitespace() {
+        if let Some(cards) = part.get(2..) {
+            suits.push(cards);
+        } else {
+            return None;
+        }
+    }
+    if suits.len() == 4 {
+        Some(suits.join("."))
+    } else {
+        None
+    }
+}
+
+/// Compute DD analysis for a single work item.
+fn dd_compute_analysis(item: &DdWorkItem) -> Result<DdAnalysisOutput> {
+    use crate::dd_analysis::compute_dd_costs;
+
+    let result = compute_dd_costs(
+        &item.deal_pbn,
+        &item.cardplay,
+        &item.contract,
+        &item.declarer,
+        false,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    if result.costs.is_empty() {
+        return Ok(DdAnalysisOutput {
+            analysis: String::new(),
+            initial_dd: result.initial_dd,
+            ol_error: 0,
+            plays_n: 0,
+            plays_s: 0,
+            plays_e: 0,
+            plays_w: 0,
+            errors_n: 0,
+            errors_s: 0,
+            errors_e: 0,
+            errors_w: 0,
+        });
+    }
+
+    let mut plays = [0u8; 4];
+    let mut errors = [0u8; 4];
+
+    let ol_error = if !result.costs[0].is_empty() && result.costs[0][0] > 0 {
+        1
+    } else {
+        0
+    };
+
+    let tricks: Vec<Vec<&str>> = item
+        .cardplay
+        .split('|')
+        .filter(|s| !s.is_empty())
+        .map(|t| t.split_whitespace().collect())
+        .collect();
+
+    let initial_leader = (result.declarer_seat + 1) % 4;
+    let mut current_leader = initial_leader;
+
+    for (trick_idx, card_costs) in result.costs.iter().enumerate() {
+        let mut seat = current_leader;
+
+        for &cost in card_costs.iter() {
+            plays[seat] += 1;
+            if cost > 0 {
+                errors[seat] += 1;
+            }
+            seat = (seat + 1) % 4;
+        }
+
+        if trick_idx < tricks.len() && tricks[trick_idx].len() == 4 {
+            let trump = dd_parse_trump_for_winner(&item.contract);
+            if let Some(winner) =
+                dd_determine_trick_winner(&tricks[trick_idx], trump, current_leader)
+            {
+                current_leader = winner;
+            }
+        }
+    }
+
+    let trick_results: Vec<String> = result
+        .costs
+        .iter()
+        .enumerate()
+        .map(|(trick_num, card_costs)| {
+            let costs_str = card_costs
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("T{}:{}", trick_num + 1, costs_str)
+        })
+        .collect();
+
+    Ok(DdAnalysisOutput {
+        analysis: trick_results.join("|"),
+        initial_dd: result.initial_dd,
+        ol_error,
+        plays_n: plays[NORTH],
+        plays_s: plays[SOUTH],
+        plays_e: plays[EAST],
+        plays_w: plays[WEST],
+        errors_n: errors[NORTH],
+        errors_s: errors[SOUTH],
+        errors_e: errors[EAST],
+        errors_w: errors[WEST],
+    })
+}
+
+/// Parse trump suit from contract for trick winner determination.
+fn dd_parse_trump_for_winner(contract: &str) -> Option<usize> {
+    let contract = contract.trim().to_uppercase();
+    if contract.contains("NT") {
+        return None;
+    }
+    for c in contract.chars() {
+        match c {
+            'S' => return Some(SPADE),
+            'H' => return Some(HEART),
+            'D' => return Some(DIAMOND),
+            'C' => return Some(CLUB),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Determine trick winner from card strings.
+fn dd_determine_trick_winner(cards: &[&str], trump: Option<usize>, leader: usize) -> Option<usize> {
+    if cards.len() != 4 {
+        return None;
+    }
+
+    let parsed: Vec<Option<(usize, u8)>> = cards
+        .iter()
+        .map(|s| {
+            if s.len() < 2 {
+                return None;
+            }
+            let suit = match s.chars().next()? {
+                'S' | 's' => SPADE,
+                'H' | 'h' => HEART,
+                'D' | 'd' => DIAMOND,
+                'C' | 'c' => CLUB,
+                _ => return None,
+            };
+            let rank_char = s.chars().nth(1)?;
+            let rank = match rank_char {
+                'A' | 'a' => 14,
+                'K' | 'k' => 13,
+                'Q' | 'q' => 12,
+                'J' | 'j' => 11,
+                'T' | 't' | '1' => 10,
+                '9' => 9,
+                '8' => 8,
+                '7' => 7,
+                '6' => 6,
+                '5' => 5,
+                '4' => 4,
+                '3' => 3,
+                '2' => 2,
+                _ => return None,
+            };
+            Some((suit, rank))
+        })
+        .collect();
+
+    let cards_parsed: Vec<(usize, u8)> = parsed.into_iter().collect::<Option<Vec<_>>>()?;
+
+    let led_suit = cards_parsed[0].0;
+    let mut winner_idx = 0;
+    let mut winner_card = cards_parsed[0];
+
+    for (i, &(suit, rank)) in cards_parsed.iter().enumerate().skip(1) {
+        let dominated = if let Some(trump_suit) = trump {
+            if suit == trump_suit && winner_card.0 != trump_suit {
+                true
+            } else if suit == trump_suit && winner_card.0 == trump_suit {
+                rank > winner_card.1
+            } else if winner_card.0 == trump_suit {
+                false
+            } else if suit == led_suit && winner_card.0 == led_suit {
+                rank > winner_card.1
+            } else {
+                suit == led_suit
+            }
+        } else if suit == led_suit && winner_card.0 == led_suit {
+            rank > winner_card.1
+        } else {
+            suit == led_suit
+        };
+
+        if dominated {
+            winner_idx = i;
+            winner_card = (suit, rank);
+        }
+    }
+
+    Some((leader + winner_idx) % 4)
+}
+
+// ============================================================================
+// Case Folder Scanning
+// ============================================================================
+
+/// Results of scanning a case folder for EDGAR report files.
+#[derive(Debug, Clone, Default)]
+pub struct CaseFiles {
+    /// BBO hand records CSV file
+    pub csv_file: Option<PathBuf>,
+    /// Concise EDGAR report text file
+    pub concise_file: Option<PathBuf>,
+    /// Hotspot EDGAR report text file
+    pub hotspot_file: Option<PathBuf>,
+}
+
+/// Anonymized versions of case files found in the EDGAR Defense folder.
+#[derive(Debug, Clone)]
+pub struct AnonCaseFiles {
+    /// Anonymized CSV file
+    pub csv_file: PathBuf,
+    /// Anonymized concise report
+    pub concise_file: PathBuf,
+    /// Anonymized hotspot report
+    pub hotspot_file: PathBuf,
+}
+
+/// Recursively scan a folder for EDGAR case files (CSV, Concise report, Hotspot report).
+pub fn scan_case_folder(folder: &Path) -> CaseFiles {
+    let mut result = CaseFiles::default();
+    scan_dir_recursive(folder, &mut result);
+    result
+}
+
+/// Recursive directory walker for case file detection.
+fn scan_dir_recursive(dir: &Path, result: &mut CaseFiles) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip EDGAR Defense output folder to avoid picking up generated files
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if dir_name == "EDGAR Defense" {
+                continue;
+            }
+            scan_dir_recursive(&path, result);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            if lower.ends_with(".csv") && result.csv_file.is_none() {
+                result.csv_file = Some(path);
+            } else if lower.ends_with(".txt")
+                && lower.contains("concise")
+                && result.concise_file.is_none()
+            {
+                result.concise_file = Some(path);
+            } else if lower.ends_with(".txt")
+                && lower.contains("hotspot")
+                && result.hotspot_file.is_none()
+            {
+                result.hotspot_file = Some(path);
+            }
+        }
+    }
+}
+
+/// Parse the Concise EDGAR Report to extract subject player BBO usernames.
+///
+/// Reads lines between the header row ("Name  Detector ...") and the separator
+/// ("---..."). The first whitespace-delimited token on each data line is the
+/// username. "pair" is skipped. Returns unique names in order of first appearance.
+pub fn parse_concise_usernames(path: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut in_data = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Detect the header row to know data follows
+        if trimmed.starts_with("Name") && trimmed.contains("Detector") {
+            in_data = true;
+            continue;
+        }
+
+        // Stop at separator line
+        if in_data && trimmed.starts_with("---") {
+            break;
+        }
+
+        if in_data {
+            if let Some(name) = trimmed.split_whitespace().next() {
+                if name != "pair" && !name.is_empty() && seen.insert(name.to_string()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    names
+}
+
+/// Extract the subject name from a Concise report filename.
+///
+/// Given a filename like "Concise AWilliams.txt", returns "AWilliams".
+/// Strips a leading "Concise" (case-insensitive) prefix and the file extension.
+pub fn extract_concise_subject(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let name = if let Some(rest) = stem.strip_prefix("Concise ") {
+        rest.trim()
+    } else if let Some(rest) = stem.strip_prefix("concise ") {
+        rest.trim()
+    } else {
+        stem.trim()
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Look for anonymized versions of case files in the EDGAR Defense folder.
+///
+/// Checks for `{stem} anon.txt` versions of concise and hotspot files,
+/// and any CSV containing "anon" in the filename.
+pub fn find_anon_files(edgar_dir: &Path, case_files: &CaseFiles) -> Option<AnonCaseFiles> {
+    // Find anon concise: {concise_stem} anon.txt
+    let anon_concise = case_files.concise_file.as_ref().and_then(|p| {
+        let stem = p.file_stem()?.to_str()?;
+        let anon_path = edgar_dir.join(format!("{} anon.txt", stem));
+        if anon_path.exists() {
+            Some(anon_path)
+        } else {
+            None
+        }
+    })?;
+
+    // Find anon hotspot: {hotspot_stem} anon.txt
+    let anon_hotspot = case_files.hotspot_file.as_ref().and_then(|p| {
+        let stem = p.file_stem()?.to_str()?;
+        let anon_path = edgar_dir.join(format!("{} anon.txt", stem));
+        if anon_path.exists() {
+            Some(anon_path)
+        } else {
+            None
+        }
+    })?;
+
+    // Find anon CSV: look for a CSV with "anon" in the name in edgar_dir
+    let anon_csv = std::fs::read_dir(edgar_dir).ok().and_then(|entries| {
+        let mut best: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let lower = name.to_lowercase();
+                if lower.ends_with(".csv") && lower.contains("anon") {
+                    // Prefer DD anon over cardplay anon (more complete)
+                    if lower.contains("dd") || best.is_none() {
+                        best = Some(path);
+                    }
+                }
+            }
+        }
+        best
+    })?;
+
+    Some(AnonCaseFiles {
+        csv_file: anon_csv,
+        concise_file: anon_concise,
+        hotspot_file: anon_hotspot,
+    })
+}
+
+// ============================================================================
+// Package Workbook
+// ============================================================================
 
 /// A single parsed hotspot entry from the hotspot report.
 #[derive(Debug, Clone)]
@@ -1960,7 +3272,7 @@ pub fn parse_hotspot_report(path: &Path) -> Result<Vec<HotspotEntry>> {
 ///
 /// Extracts the path component after `tinyurl.com/` and lowercases it.
 /// Falls back to trimmed lowercase of the full URL if not a tinyurl.
-fn normalize_tinyurl(url: &str) -> String {
+pub fn normalize_tinyurl(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     let lower = trimmed.to_lowercase();
     if let Some(pos) = lower.find("tinyurl.com/") {
@@ -2754,6 +4066,10 @@ mod tests {
         writeln!(f, "played by longplayer1").unwrap();
         // Name adjacent to punctuation — simple replacement
         writeln!(f, "longplayer1:").unwrap();
+        // Compound name: both names joined by dash, column debt carries across
+        writeln!(f, "longplayer1-player2             Hit :  1").unwrap();
+        // Two names on same line with separate whitespace gaps
+        writeln!(f, "longplayer1 (N) player2 (S)     Leader").unwrap();
         f.flush().unwrap();
 
         let mappings = vec![
@@ -2761,8 +4077,9 @@ mod tests {
             ("player2".to_string(), "Sally".to_string()),
         ];
         let empty_urls = HashMap::new();
+        let empty_board_ids: HashMap<String, (String, String)> = HashMap::new();
 
-        anonymize_text_file(&input, &output, &mappings, &empty_urls).unwrap();
+        anonymize_text_file(&input, &output, &mappings, &empty_urls, &empty_board_ids).unwrap();
 
         let result = std::fs::read_to_string(&output).unwrap();
         let lines: Vec<&str> = result.lines().collect();
@@ -2780,6 +4097,13 @@ mod tests {
         assert_eq!(lines[4], "played by Bob");
         // Name adjacent to punctuation — simple replacement
         assert_eq!(lines[5], "Bob:");
+        // Compound name: "longplayer1-player2             Hit" (11+1+7+13=32 before "Hit")
+        // -> "Bob-Sally                       Hit" (3+1+5+23=32) — cumulative debt absorbed
+        assert_eq!(lines[6], "Bob-Sally                       Hit :  1");
+        // Two names: each whitespace gap absorbs its own debt independently
+        // "longplayer1 (N) player2 (S)     Leader" — (N) at col 12, (S) at col 20, Leader at col 32
+        // -> "Bob         (N) Sally   (S)     Leader" — same column positions
+        assert_eq!(lines[7], "Bob         (N) Sally   (S)     Leader");
     }
 
     #[test]
@@ -2800,7 +4124,7 @@ mod tests {
             " 2. PassedForce Miss  Contract: 1S   Lead: D4   2023-07-03 http://tinyurl.com/DEF456 player2"
         )
         .unwrap();
-        // Unmatched tinyurl (not in url_mappings) — should be redacted
+        // Unmatched tinyurl (not in board_id_map) — should show [unknown]
         writeln!(
             f,
             " 3. PassedForce Hit   Contract: 3N   Lead: H2   2022-05-10 http://tinyurl.com/NOMATCH player1"
@@ -2822,15 +4146,43 @@ mod tests {
             "https://www.bridgebase.com/tools/handviewer.html?lin=anon2".to_string(),
         );
 
-        anonymize_text_file(&input, &output, &name_mappings, &url_mappings).unwrap();
+        let mut board_id_map: HashMap<String, (String, String)> = HashMap::new();
+        board_id_map.insert(
+            "abc123".to_string(),
+            (
+                "42".to_string(),
+                "https://original.example.com/1".to_string(),
+            ),
+        );
+        board_id_map.insert(
+            "def456".to_string(),
+            (
+                "99".to_string(),
+                "https://original.example.com/2".to_string(),
+            ),
+        );
+
+        anonymize_text_file(
+            &input,
+            &output,
+            &name_mappings,
+            &url_mappings,
+            &board_id_map,
+        )
+        .unwrap();
 
         let result = std::fs::read_to_string(&output).unwrap();
-        // Tinyurls replaced with full handviewer URLs
-        assert!(result.contains("handviewer.html?lin=anon1"));
-        assert!(result.contains("handviewer.html?lin=anon2"));
-        // Tinyurls removed (matched ones replaced, unmatched ones redacted)
+        let lines: Vec<&str> = result.lines().collect();
+
+        // Tinyurl replaced with Board_ID, anonymized LIN_URL appended
+        assert!(lines[0].contains(" 42 "));
+        assert!(lines[0].ends_with("handviewer.html?lin=anon1"));
+        assert!(lines[1].contains(" 99 "));
+        assert!(lines[1].ends_with("handviewer.html?lin=anon2"));
+        // Unmatched tinyurl shows [unknown], no LIN_URL appended
+        assert!(lines[2].contains("[unknown]"));
+        // Tinyurls removed
         assert!(!result.contains("tinyurl.com"));
-        assert!(result.contains("[URL redacted]"));
         // Names replaced
         assert!(result.contains("Bob"));
         assert!(result.contains("Sally"));
