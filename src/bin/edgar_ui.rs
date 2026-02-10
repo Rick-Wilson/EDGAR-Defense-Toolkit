@@ -1397,15 +1397,66 @@ impl App {
         };
 
         let progress_section = if self.is_running && self.running_tab == Some(TabId::Analyze) {
-            column![
-                progress_bar(0.0..=1.0, self.progress),
-                text(format!(
-                    "{}/{} ({} errors)",
-                    self.progress_completed, self.progress_total, self.progress_errors
-                ))
-                .size(13),
-            ]
-            .spacing(4)
+            let mut items: Vec<Element<'_, Message>> = Vec::new();
+            items.push(progress_bar(0.0..=1.0, self.progress).into());
+
+            let progress_text = format!(
+                "{}/{} ({} errors, {} skipped)",
+                self.progress_completed,
+                self.progress_total,
+                self.progress_errors,
+                self.progress_skipped
+            );
+            items.push(text(progress_text).size(13).into());
+
+            // ETA calculation — exclude skipped rows from rate
+            if let Some(start) = self.fetch_start_time {
+                let processed = self
+                    .progress_completed
+                    .saturating_sub(self.progress_skipped);
+                let remaining_items = self.progress_total.saturating_sub(self.progress_completed);
+
+                if processed > 0 && self.progress_total > 0 {
+                    let elapsed = start.elapsed();
+                    let rate = processed as f64 / elapsed.as_secs_f64();
+                    let remaining_secs = if rate > 0.0 {
+                        remaining_items as f64 / rate
+                    } else {
+                        0.0
+                    };
+
+                    let remaining_dur = std::time::Duration::from_secs_f64(remaining_secs);
+                    let remaining_mins = remaining_dur.as_secs() / 60;
+                    let remaining_secs_part = remaining_dur.as_secs() % 60;
+
+                    let eta =
+                        chrono::Local::now() + chrono::Duration::seconds(remaining_secs as i64);
+                    let eta_str = eta.format("%l:%M %p").to_string();
+
+                    let time_text = format!(
+                        "~{:>3} min {:>2} sec remaining  |  ETA: {:>8}",
+                        remaining_mins,
+                        remaining_secs_part,
+                        eta_str.trim()
+                    );
+                    items.push(
+                        container(text(time_text).size(13).font(iced::Font::MONOSPACE))
+                            .width(Fill)
+                            .into(),
+                    );
+                } else if self.progress_completed > 0 {
+                    items.push(
+                        text(format!(
+                            "Resuming... ({} skipped so far)",
+                            self.progress_skipped
+                        ))
+                        .size(13)
+                        .into(),
+                    );
+                }
+            }
+
+            column(items).spacing(4)
         } else {
             column![]
         };

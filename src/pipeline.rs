@@ -113,19 +113,20 @@ fn generate_lookup_file(
 
     // Open lookup file for writing (append if resuming)
     let resuming = existing_rows > 0;
-    let mut out = if resuming {
-        std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&config.lookup_output)?,
-        )
+    let file: std::fs::File = if resuming {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&config.lookup_output)?
     } else {
-        std::io::BufWriter::new(std::fs::File::create(&config.lookup_output)?)
+        std::fs::File::create(&config.lookup_output)?
     };
+    let mut out = csv::WriterBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .from_writer(std::io::BufWriter::new(file));
 
     if !resuming {
-        use std::io::Write;
-        writeln!(out, "{}", LOOKUP_HEADER)?;
+        out.write_record(LOOKUP_FIELDS)?;
     }
 
     let mut processed = 0usize;
@@ -147,7 +148,6 @@ fn generate_lookup_file(
                 skipped,
             });
             if !keep_going {
-                use std::io::Write;
                 out.flush()?;
                 return Ok(format!(
                     "Cancelled after {} of {} rows ({} errors, {} skipped)",
@@ -165,7 +165,6 @@ fn generate_lookup_file(
             skipped,
         });
         if !keep_going {
-            use std::io::Write;
             out.flush()?;
             return Ok(format!(
                 "Cancelled after {} of {} rows ({} errors, {} skipped)",
@@ -176,8 +175,7 @@ fn generate_lookup_file(
         let tinyurl = record.get(url_col_idx).unwrap_or("").trim();
 
         if tinyurl.is_empty() {
-            use std::io::Write;
-            writeln!(out, "{},{},,,,,,,,,,,,,", board_id, tinyurl)?;
+            write_lookup_empty_row(&mut out, board_id, tinyurl)?;
             continue;
         }
 
@@ -200,18 +198,15 @@ fn generate_lookup_file(
                     resolver.reset_batch();
                 }
 
-                use std::io::Write;
-                writeln!(out, "{},{},,,,,,,,,,,,,", board_id, tinyurl)?;
+                write_lookup_empty_row(&mut out, board_id, tinyurl)?;
             }
         }
 
         if processed.is_multiple_of(100) {
-            use std::io::Write;
             out.flush()?;
         }
     }
 
-    use std::io::Write;
     out.flush()?;
     Ok(format!(
         "Done! Processed {} rows ({} errors, {} skipped)",
@@ -1591,7 +1586,7 @@ fn format_vulnerability(v: &Vulnerability) -> &'static str {
 
 /// Write a single lookup row from parsed LIN data.
 fn write_lookup_row(
-    out: &mut impl std::io::Write,
+    out: &mut csv::Writer<impl std::io::Write>,
     board_id: usize,
     tinyurl: &str,
     lin: &LinData,
@@ -1605,31 +1600,70 @@ fn write_lookup_row(
     let explanations = format_explanations(lin);
     let vulnerability = format_vulnerability(&lin.vulnerability);
 
-    writeln!(
-        out,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        board_id,
+    out.write_record([
+        &board_id.to_string(),
         tinyurl,
         board_header,
-        lin.player_names[0], // S
-        lin.player_names[1], // W
-        lin.player_names[2], // N
-        lin.player_names[3], // E
-        format_args!("{:?}", lin.dealer),
+        &lin.player_names[0], // S
+        &lin.player_names[1], // W
+        &lin.player_names[2], // N
+        &lin.player_names[3], // E
+        &format!("{:?}", lin.dealer),
         vulnerability,
-        deal_pbn,
-        auction,
-        explanations,
-        cardplay,
-        claim,
+        &deal_pbn,
+        &auction,
+        &explanations,
+        &cardplay,
+        &claim,
         lin_url,
-    )?;
+    ])?;
     Ok(())
 }
 
-/// The header line for the tinyurl lookup CSV.
-const LOOKUP_HEADER: &str = "Board_ID,TinyURL,Board_Header,Player_S,Player_W,Player_N,Player_E,\
-                              Dealer,Vulnerability,Deal_PBN,Auction,Explanations,Cardplay,Claim,LIN_URL";
+/// Write an empty lookup row (for missing/error URLs).
+fn write_lookup_empty_row(
+    out: &mut csv::Writer<impl std::io::Write>,
+    board_id: usize,
+    tinyurl: &str,
+) -> Result<()> {
+    out.write_record([
+        &board_id.to_string(),
+        tinyurl,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ])?;
+    Ok(())
+}
+
+/// The header fields for the tinyurl lookup CSV.
+const LOOKUP_FIELDS: &[&str] = &[
+    "Board_ID",
+    "TinyURL",
+    "Board_Header",
+    "Player_S",
+    "Player_W",
+    "Player_N",
+    "Player_E",
+    "Dealer",
+    "Vulnerability",
+    "Deal_PBN",
+    "Auction",
+    "Explanations",
+    "Cardplay",
+    "Claim",
+    "LIN_URL",
+];
 
 // ============================================================================
 // Internal Helpers
@@ -2510,6 +2544,9 @@ pub fn analyze_dd(
         let cancelled_ref = &cancelled;
         let done_ref = &done;
 
+        // skipped_all = rows not needing analysis (resume + incomplete/passout/etc)
+        let skipped_all = skipped_no_work + skipped_resume;
+
         s.spawn(move || {
             let mut on_progress = on_progress;
             loop {
@@ -2517,7 +2554,7 @@ pub fn analyze_dd(
                 let completed = processed_ref.load(Ordering::Relaxed);
                 let errors = error_ref.load(Ordering::Relaxed);
                 let progress = DdProgress {
-                    completed: completed + skipped_no_work,
+                    completed: completed + skipped_all,
                     total: total_rows,
                     errors,
                     skipped: skipped_resume,
@@ -2530,7 +2567,7 @@ pub fn analyze_dd(
                     let completed = processed_ref.load(Ordering::Relaxed);
                     let errors = error_ref.load(Ordering::Relaxed);
                     let _ = on_progress(&DdProgress {
-                        completed: completed + skipped_no_work,
+                        completed: completed + skipped_all,
                         total: total_rows,
                         errors,
                         skipped: skipped_resume,
