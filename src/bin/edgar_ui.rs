@@ -481,11 +481,13 @@ impl App {
                     subject_players: self.case_usernames.clone(),
                     deal_limit: self.deal_limit(),
                     cardplay_file,
+                    is_anon: false,
                 };
 
                 // Check for anon files
                 let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
-                let anon_files = pipeline::find_anon_files(&edgar_dir, &self.case_files);
+                let anon_files =
+                    pipeline::find_anon_files(&edgar_dir, &self.case_files, self.deal_limit());
                 let anon_config = anon_files.map(|af| {
                     let subject = self
                         .case_files
@@ -495,15 +497,33 @@ impl App {
                         .unwrap_or_else(|| "Report".to_string());
                     let anon_output =
                         edgar_dir.join(format!("EDGAR Defense {} anon.xlsx", subject));
+
+                    // Extract anon aliases for subject players from the anon map
+                    let map_entries: std::collections::HashMap<String, String> = self
+                        .anon_map
+                        .split(',')
+                        .filter_map(|pair| {
+                            pair.split_once('=').map(|(orig, alias)| {
+                                (orig.trim().to_lowercase(), alias.trim().to_string())
+                            })
+                        })
+                        .collect();
+                    let anon_subject_players: Vec<String> = self
+                        .case_usernames
+                        .iter()
+                        .filter_map(|name| map_entries.get(&name.to_lowercase()).cloned())
+                        .collect();
+
                     pipeline::PackageConfig {
                         csv_file: af.csv_file,
                         hotspot_file: af.hotspot_file,
                         concise_file: af.concise_file,
                         output: anon_output,
                         case_folder: self.case_folder.clone(),
-                        subject_players: self.case_usernames.clone(),
+                        subject_players: anon_subject_players,
                         deal_limit: self.deal_limit(),
-                        cardplay_file: None,
+                        cardplay_file: config.cardplay_file.clone(),
+                        is_anon: true,
                     }
                 });
 
@@ -644,7 +664,7 @@ impl App {
                     csv_output: PathBuf::from(&csv_output),
                     key,
                     map: self.anon_map.clone(),
-                    columns: "N,S,E,W,Ob name,Dec name,Leader"
+                    columns: "N,S,E,W,OB name,Dec name,Leader"
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .collect(),
@@ -1607,7 +1627,8 @@ impl App {
         );
 
         let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
-        let has_anon = pipeline::find_anon_files(&edgar_dir, &self.case_files).is_some();
+        let has_anon =
+            pipeline::find_anon_files(&edgar_dir, &self.case_files, self.deal_limit()).is_some();
         if has_anon {
             let subject = self
                 .case_files

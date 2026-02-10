@@ -177,7 +177,7 @@ enum Commands {
         /// LIN_URL column is also processed automatically (pn| tag).
         #[arg(
             long,
-            default_value = "N,S,E,W,Ob name,Dec name,Leader",
+            default_value = "N,S,E,W,OB name,Dec name,Leader",
             value_delimiter = ','
         )]
         columns: Vec<String>,
@@ -356,6 +356,7 @@ fn main() -> Result<()> {
                 subject_players: subjects.clone(),
                 deal_limit: limit,
                 cardplay_file,
+                is_anon: false,
             };
 
             eprintln!("Creating {}...", output.display());
@@ -363,7 +364,7 @@ fn main() -> Result<()> {
             eprintln!("{}", summary);
 
             // Check for anon files and create anon workbook
-            if let Some(anon_files) = pipeline::find_anon_files(&edgar_dir, &case_files) {
+            if let Some(anon_files) = pipeline::find_anon_files(&edgar_dir, &case_files, limit) {
                 let anon_output = edgar_dir.join(format!("EDGAR Defense {} anon.xlsx", subject));
 
                 let anon_config = pipeline::PackageConfig {
@@ -374,7 +375,8 @@ fn main() -> Result<()> {
                     case_folder: folder.display().to_string(),
                     subject_players: subjects,
                     deal_limit: limit,
-                    cardplay_file: None,
+                    cardplay_file: config.cardplay_file.clone(),
+                    is_anon: true,
                 };
 
                 eprintln!("\nCreating {}...", anon_output.display());

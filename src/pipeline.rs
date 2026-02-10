@@ -3199,9 +3199,17 @@ pub fn extract_concise_subject(path: &Path) -> Option<String> {
 
 /// Look for anonymized versions of case files in the EDGAR Defense folder.
 ///
-/// Checks for `{stem} anon.txt` versions of concise and hotspot files,
-/// and any CSV containing "anon" in the filename.
-pub fn find_anon_files(edgar_dir: &Path, case_files: &CaseFiles) -> Option<AnonCaseFiles> {
+/// Constructs exact filenames from the subject name and deal limit:
+/// - Anon CSV: `{subject} [N] DD anon.csv`
+/// - Anon concise: `{concise_stem} anon.txt`
+/// - Anon hotspot: `{hotspot_stem} anon.txt`
+///
+/// Returns `None` if any required file does not exist.
+pub fn find_anon_files(
+    edgar_dir: &Path,
+    case_files: &CaseFiles,
+    deal_limit: Option<usize>,
+) -> Option<AnonCaseFiles> {
     // Find anon concise: {concise_stem} anon.txt
     let anon_concise = case_files.concise_file.as_ref().and_then(|p| {
         let stem = p.file_stem()?.to_str()?;
@@ -3224,23 +3232,19 @@ pub fn find_anon_files(edgar_dir: &Path, case_files: &CaseFiles) -> Option<AnonC
         }
     })?;
 
-    // Find anon CSV: look for a CSV with "anon" in the name in edgar_dir
-    let anon_csv = std::fs::read_dir(edgar_dir).ok().and_then(|entries| {
-        let mut best: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let lower = name.to_lowercase();
-                if lower.ends_with(".csv") && lower.contains("anon") {
-                    // Prefer DD anon over cardplay anon (more complete)
-                    if lower.contains("dd") || best.is_none() {
-                        best = Some(path);
-                    }
-                }
-            }
-        }
-        best
-    })?;
+    // Construct anon CSV filename: "{subject} [N] DD anon.csv"
+    let subject = case_files
+        .concise_file
+        .as_deref()
+        .and_then(extract_concise_subject)?;
+    let anon_csv_name = match deal_limit {
+        Some(n) => format!("{} {} DD anon.csv", subject, n),
+        None => format!("{} DD anon.csv", subject),
+    };
+    let anon_csv = edgar_dir.join(&anon_csv_name);
+    if !anon_csv.exists() {
+        return None;
+    }
 
     Some(AnonCaseFiles {
         csv_file: anon_csv,
@@ -3266,30 +3270,55 @@ pub struct HotspotEntry {
     pub contract: String,
     /// Opening lead card (e.g. "S6", "H7")
     pub lead: String,
-    /// TinyURL to BBO hand viewer
+    /// TinyURL to BBO hand viewer (or LIN_URL for anon format)
     pub tinyurl: String,
     /// Subject player BBO username
     pub subject_player: String,
+    /// Board ID (only set for anon format hotspot reports)
+    pub board_id: Option<String>,
+    /// Anonymized LIN URL (only set for anon format hotspot reports)
+    pub lin_url: Option<String>,
 }
 
 /// Parse a hotspot report text file into a vector of HotspotEntry.
+///
+/// Handles both original format (tinyurl + player) and anon format
+/// (board_id + player + LIN_URL).
 pub fn parse_hotspot_report(path: &Path) -> Result<Vec<HotspotEntry>> {
     use regex::Regex;
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read hotspot report: {}", path.display()))?;
 
-    // Match lines like:
+    // Anon format: ... date board_id player lin_url
+    //  1. PassedForce Hit   Contract: 2N   Lead: S6   2021-10-21 42 Bob https://www.bridgebase.com/...
+    let anon_re = Regex::new(
+        r"^\s*(\d+)\.\s+(\S+)\s+(Hit|Miss)\s+\S*\s*Contract:\s+(\S+)\s+Lead:\s+(\S+)\s+\S+\s+(\d+)\s+(\S+)\s+(https?://\S+)",
+    )?;
+
+    // Original format: ... date tinyurl player
     //  1. PassedForce Hit   Contract: 2N   Lead: S6   2021-10-21 http://tinyurl.com/abc player
-    //  1. Weird_OLs Hit  AQ_UnderT Contract: 5D   Lead: H7   2020-06-28 http://... player
-    let entry_re = Regex::new(
+    let orig_re = Regex::new(
         r"^\s*(\d+)\.\s+(\S+)\s+(Hit|Miss)\s+\S*\s*Contract:\s+(\S+)\s+Lead:\s+(\S+)\s+\S+\s+(https?://\S+)\s+(\S+)",
     )?;
 
     let mut entries = Vec::new();
 
     for line in content.lines() {
-        if let Some(caps) = entry_re.captures(line) {
+        if let Some(caps) = anon_re.captures(line) {
+            let lin_url = caps[8].to_string();
+            entries.push(HotspotEntry {
+                subindex: caps[1].parse().unwrap_or(0),
+                category: caps[2].to_string(),
+                hit_miss: caps[3].to_string(),
+                contract: caps[4].to_string(),
+                lead: caps[5].to_string(),
+                tinyurl: lin_url.clone(),
+                subject_player: caps[7].to_string(),
+                board_id: Some(caps[6].to_string()),
+                lin_url: Some(lin_url),
+            });
+        } else if let Some(caps) = orig_re.captures(line) {
             entries.push(HotspotEntry {
                 subindex: caps[1].parse().unwrap_or(0),
                 category: caps[2].to_string(),
@@ -3298,6 +3327,8 @@ pub fn parse_hotspot_report(path: &Path) -> Result<Vec<HotspotEntry>> {
                 lead: caps[5].to_string(),
                 tinyurl: caps[6].to_string(),
                 subject_player: caps[7].to_string(),
+                board_id: None,
+                lin_url: None,
             });
         }
     }
@@ -3317,6 +3348,40 @@ pub fn normalize_tinyurl(url: &str) -> String {
     } else {
         lower
     }
+}
+
+/// Percent-decode a URL string (`%7C` → `|`, `%2C` → `,`, etc.).
+///
+/// Used before passing URLs to `rust_xlsxwriter::Url::new()` to avoid
+/// double-encoding (the library encodes the URL itself).
+fn percent_decode_url(s: &str) -> String {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = match bytes[i + 1] {
+                b'0'..=b'9' => Some(bytes[i + 1] - b'0'),
+                b'a'..=b'f' => Some(bytes[i + 1] - b'a' + 10),
+                b'A'..=b'F' => Some(bytes[i + 1] - b'A' + 10),
+                _ => None,
+            };
+            let lo = match bytes[i + 2] {
+                b'0'..=b'9' => Some(bytes[i + 2] - b'0'),
+                b'a'..=b'f' => Some(bytes[i + 2] - b'a' + 10),
+                b'A'..=b'F' => Some(bytes[i + 2] - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(h), Some(l)) = (hi, lo) {
+                result.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
 }
 
 /// Normalize a URL to use https scheme.
@@ -3361,6 +3426,8 @@ pub struct PackageConfig {
     pub deal_limit: Option<usize>,
     /// Optional path to cardplay CSV (output of fetch step)
     pub cardplay_file: Option<PathBuf>,
+    /// Whether this is an anonymized package (changes link handling)
+    pub is_anon: bool,
 }
 
 /// Create a packaged Excel workbook from the three EDGAR case files.
@@ -3370,7 +3437,7 @@ pub struct PackageConfig {
 pub fn package_workbook(config: &PackageConfig) -> Result<String> {
     use rust_xlsxwriter::{
         ConditionalFormatText, ConditionalFormatTextRule, Format, FormatAlign, FormatUnderline,
-        Formula, Workbook,
+        Formula, Url, Workbook,
     };
 
     // -- Read CSV --
@@ -3393,13 +3460,21 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
         .position(|h| h == "BBO")
         .ok_or_else(|| anyhow::anyhow!("'BBO' column not found in CSV"))?;
 
+    // Find LIN_URL column index in CSV (used for anon link creation)
+    let lin_url_col_csv = headers.iter().position(|h| h == "LIN_URL");
+
     // -- Parse hotspot report --
     let hotspot_entries = parse_hotspot_report(&config.hotspot_file)?;
 
-    // Build normalized tinyurl -> (hotspot_id_1based, category) for first match
+    // Build key -> (hotspot_id_1based, category) for first match
+    // For anon: key by board_id; for original: key by normalized tinyurl
     let mut url_to_hotspot: HashMap<String, (u32, String)> = HashMap::new();
     for (i, entry) in hotspot_entries.iter().enumerate() {
-        let key = normalize_tinyurl(&entry.tinyurl);
+        let key = if let Some(bid) = &entry.board_id {
+            bid.clone()
+        } else {
+            normalize_tinyurl(&entry.tinyurl)
+        };
         url_to_hotspot
             .entry(key)
             .or_insert(((i + 1) as u32, entry.category.clone()));
@@ -3645,9 +3720,22 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
             // Board ID (sequential number)
             sheet.write_number(row, 0, (i + 1) as f64)?;
 
-            // Link: =HYPERLINK(BBO_cell, "link") with blue underline formatting
+            // Link: hyperlink to hand viewer
             let bbo_url = record.get(bbo_col_csv).unwrap_or("").trim();
-            if !bbo_url.is_empty() {
+            if config.is_anon {
+                // Anon: BBO column has Board_ID, use LIN_URL for the link.
+                // Use write_url (cell hyperlink) instead of HYPERLINK formula
+                // because LIN URLs exceed Excel's 255-char formula URL limit.
+                if let Some(lin_idx) = lin_url_col_csv {
+                    let lin_url = record.get(lin_idx).unwrap_or("").trim();
+                    if !lin_url.is_empty() {
+                        let decoded = percent_decode_url(lin_url);
+                        let url = Url::new(&decoded).set_text("link");
+                        sheet.write_url_with_format(row, 1, &url, &link_fmt)?;
+                    }
+                }
+            } else if !bbo_url.is_empty() {
+                // Original: BBO column has tinyurl
                 let bbo_cell = format!(
                     "{col}${row}",
                     col = col_letter(bbo_col_boards as u32),
@@ -3657,9 +3745,14 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
                 sheet.write_formula_with_format(row, 1, Formula::new(link_formula), &link_fmt)?;
             }
 
-            // Hotspot ID and Category (matched via normalized tinyurl)
+            // Hotspot ID and Category
             if !bbo_url.is_empty() {
-                let key = normalize_tinyurl(bbo_url);
+                // Anon: BBO has Board_ID, match directly; Original: normalize tinyurl
+                let key = if config.is_anon {
+                    bbo_url.to_string()
+                } else {
+                    normalize_tinyurl(bbo_url)
+                };
                 if let Some((hs_id, hs_cat)) = url_to_hotspot.get(&key) {
                     let hs_link = format!(
                         "HYPERLINK(\"#Hotspots!A\"&MATCH({id},Hotspots!$A:$A,0),{id})",
@@ -3807,20 +3900,47 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
             // Hotspot ID (sequential number)
             sheet.write_number(row, 0, (i + 1) as f64)?;
 
-            // Link: =HYPERLINK(C{row}, "Link") with blue underline formatting
-            let link_formula = format!("HYPERLINK(C{0},\"Link\")", excel_row);
-            sheet.write_formula_with_format(row, 1, Formula::new(link_formula), &link_fmt)?;
+            // Link to hand viewer
+            if let Some(ref url_str) = entry.lin_url {
+                // Anon: use write_url (cell hyperlink) instead of HYPERLINK formula
+                // because LIN URLs exceed Excel's 255-char formula URL limit.
+                // Percent-decode first to avoid double-encoding by rust_xlsxwriter.
+                let decoded = percent_decode_url(url_str);
+                let url = Url::new(&decoded).set_text("Link");
+                sheet.write_url_with_format(row, 1, &url, &link_fmt)?;
+                // Column C: LIN_URL as plain text (for reference)
+                sheet.write_string(row, 2, url_str)?;
+            } else {
+                // Original: HYPERLINK formula referencing tinyurl in column C
+                let link_formula = format!("HYPERLINK(C{0},\"Link\")", excel_row);
+                sheet.write_formula_with_format(row, 1, Formula::new(link_formula), &link_fmt)?;
+                // Column C: tinyurl (normalized to https)
+                sheet.write_string(row, 2, to_https(&entry.tinyurl))?;
+            }
 
-            // Tinyurl (normalized to https, plain text for MATCH reference)
-            sheet.write_string(row, 2, to_https(&entry.tinyurl))?;
-
-            // Board ID: HYPERLINK back to Boards row, with INDEX/MATCH lookup
-            let board_id_formula = format!(
-                "IFERROR(HYPERLINK(\"#Boards!A\"&MATCH(C{row},Boards!${col}:${col},0),INDEX(Boards!$A:$A,MATCH(C{row},Boards!${col}:${col},0))),\"\")",
-                row = excel_row,
-                col = bbo_col_letter,
-            );
-            sheet.write_formula_with_format(row, 3, Formula::new(board_id_formula), &link_fmt)?;
+            // Board ID: HYPERLINK back to Boards row
+            if let Some(ref bid) = entry.board_id {
+                // Anon: direct board_id lookup against Boards!$A:$A
+                let bid_num: u32 = bid.parse().unwrap_or(0);
+                let formula = format!(
+                    "HYPERLINK(\"#Boards!A\"&MATCH({id},Boards!$A:$A,0),{id})",
+                    id = bid_num
+                );
+                sheet.write_formula_with_format(row, 3, Formula::new(formula), &link_fmt)?;
+            } else {
+                // Original: INDEX/MATCH via tinyurl against BBO column
+                let board_id_formula = format!(
+                    "IFERROR(HYPERLINK(\"#Boards!A\"&MATCH(C{row},Boards!${col}:${col},0),INDEX(Boards!$A:$A,MATCH(C{row},Boards!${col}:${col},0))),\"\")",
+                    row = excel_row,
+                    col = bbo_col_letter,
+                );
+                sheet.write_formula_with_format(
+                    row,
+                    3,
+                    Formula::new(board_id_formula),
+                    &link_fmt,
+                )?;
+            }
 
             sheet.write_string(row, 4, &entry.category)?;
             sheet.write_number(row, 5, entry.subindex as f64)?;
@@ -4072,6 +4192,8 @@ mod tests {
         assert_eq!(entries[0].lead, "S6");
         assert_eq!(entries[0].tinyurl, "http://tinyurl.com/abc123");
         assert_eq!(entries[0].subject_player, "player1");
+        assert!(entries[0].board_id.is_none());
+        assert!(entries[0].lin_url.is_none());
 
         assert_eq!(entries[1].category, "PassedForce");
         assert_eq!(entries[1].subindex, 2);
@@ -4083,6 +4205,46 @@ mod tests {
         assert_eq!(entries[2].contract, "5D");
         assert_eq!(entries[2].lead, "H7");
         assert_eq!(entries[2].subject_player, "player1");
+    }
+
+    #[test]
+    fn test_parse_hotspot_report_anon() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hotspot_anon.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "HOTSPOT REPORTS FOR test\n").unwrap();
+        writeln!(f, "--------------------------------------------------").unwrap();
+        writeln!(
+            f,
+            " 1. PassedForce Hit   Contract: 2N   Lead: S6   2021-10-21 42 Bob https://www.bridgebase.com/tools/handviewer.html?lin=pn|Bob,Alice,Carol,Dave|"
+        )
+        .unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            " 2. Weird_OLs Miss  AQ_UnderT Contract: 5D   Lead: H7   2020-06-28 99 Alice https://www.bridgebase.com/tools/handviewer.html?lin=pn|Alice,Bob,Dave,Carol|"
+        )
+        .unwrap();
+
+        let entries = parse_hotspot_report(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].category, "PassedForce");
+        assert_eq!(entries[0].subindex, 1);
+        assert_eq!(entries[0].hit_miss, "Hit");
+        assert_eq!(entries[0].contract, "2N");
+        assert_eq!(entries[0].lead, "S6");
+        assert_eq!(entries[0].subject_player, "Bob");
+        assert_eq!(entries[0].board_id.as_deref(), Some("42"));
+        assert!(entries[0].lin_url.is_some());
+        assert!(entries[0].lin_url.as_ref().unwrap().starts_with("https://"));
+
+        assert_eq!(entries[1].category, "Weird_OLs");
+        assert_eq!(entries[1].subindex, 2);
+        assert_eq!(entries[1].hit_miss, "Miss");
+        assert_eq!(entries[1].subject_player, "Alice");
+        assert_eq!(entries[1].board_id.as_deref(), Some("99"));
     }
 
     #[test]
