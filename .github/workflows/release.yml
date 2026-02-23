@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: macOS Universal
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-release-
+
+      - name: Build aarch64
+        run: cargo build --release --target aarch64-apple-darwin --bin edgar-ui --bin bbo-csv
+
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-apple-darwin --bin edgar-ui --bin bbo-csv
+
+      - name: Create universal binaries
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/edgar-ui \
+            target/x86_64-apple-darwin/release/edgar-ui \
+            -output target/universal-apple-darwin/release/edgar-ui
+          lipo -create \
+            target/aarch64-apple-darwin/release/bbo-csv \
+            target/x86_64-apple-darwin/release/bbo-csv \
+            -output target/universal-apple-darwin/release/bbo-csv
+          echo "--- edgar-ui ---"
+          lipo -info target/universal-apple-darwin/release/edgar-ui
+          echo "--- bbo-csv ---"
+          lipo -info target/universal-apple-darwin/release/bbo-csv
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create .app bundle
+        run: |
+          APP="EDGAR Defense Toolkit.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          # Patch version into Info.plist from Cargo.toml
+          VERSION="${{ steps.version.outputs.version }}"
+          sed "s/0\.1\.0/$VERSION/g" macos/Info.plist > "$APP/Contents/Info.plist"
+
+          cp target/universal-apple-darwin/release/edgar-ui "$APP/Contents/MacOS/"
+          cp target/universal-apple-darwin/release/bbo-csv "$APP/Contents/MacOS/"
+
+          if [ -f macos/AppIcon.icns ]; then
+            cp macos/AppIcon.icns "$APP/Contents/Resources/"
+          fi
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          KEYCHAIN="build.keychain"
+          KEYCHAIN_PWD="actions"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import certificate.p12 -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          rm certificate.p12
+
+      - name: Sign the .app bundle
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: |
+          APP="EDGAR Defense Toolkit.app"
+          # Sign each binary individually first, then the bundle
+          codesign --force --verify --verbose \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --options runtime \
+            --entitlements macos/entitlements.plist \
+            "$APP/Contents/MacOS/bbo-csv"
+          codesign --force --verify --verbose \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --options runtime \
+            --entitlements macos/entitlements.plist \
+            "$APP/Contents/MacOS/edgar-ui"
+          codesign --deep --force --verify --verbose \
+            --sign "$MACOS_CERTIFICATE_NAME" \
+            --options runtime \
+            --entitlements macos/entitlements.plist \
+            "$APP"
+          echo "--- Verify signature ---"
+          codesign --verify --verbose=2 "$APP"
+
+      - name: Notarize the .app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP="EDGAR Defense Toolkit.app"
+          ditto -c -k --keepParent "$APP" "app-notarize.zip"
+          xcrun notarytool submit "app-notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP"
+          rm "app-notarize.zip"
+
+      - name: Create DMG
+        run: |
+          brew install create-dmg
+
+          # create-dmg returns non-zero if no icon is set; || true handles that
+          create-dmg \
+            --volname "EDGAR Defense Toolkit" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "EDGAR Defense Toolkit.app" 150 185 \
+            --hide-extension "EDGAR Defense Toolkit.app" \
+            --app-drop-link 450 185 \
+            "EDGAR-Defense-Toolkit-${{ github.ref_name }}-macOS.dmg" \
+            "EDGAR Defense Toolkit.app" \
+            || true
+
+          ls -la *.dmg
+
+      - name: Sign and notarize the DMG
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG="EDGAR-Defense-Toolkit-${{ github.ref_name }}-macOS.dmg"
+          codesign --force --sign "$MACOS_CERTIFICATE_NAME" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: "EDGAR-Defense-Toolkit-${{ github.ref_name }}-macOS.dmg"
+
+      - name: Create standalone bbo-csv zip
+        run: |
+          mkdir -p staging
+          cp target/universal-apple-darwin/release/bbo-csv staging/
+          cd staging && zip ../bbo-csv-${{ github.ref_name }}-macOS-universal.zip bbo-csv
+
+      - name: Upload bbo-csv zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-bbo-csv
+          path: "bbo-csv-${{ github.ref_name }}-macOS-universal.zip"
+
+  build-windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-release-
+
+      - name: Build release binaries
+        run: cargo build --release --bin edgar-ui --bin bbo-csv
+
+      - name: Create zip with executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item target\release\edgar-ui.exe staging\
+          Copy-Item target\release\bbo-csv.exe staging\
+          Compress-Archive -Path staging\* `
+            -DestinationPath "EDGAR-Defense-Toolkit-${{ github.ref_name }}-Windows.zip"
+
+      - name: Install cargo-wix and build MSI
+        run: |
+          cargo install cargo-wix
+          cargo wix init --name edgar-ui
+          cargo wix --name edgar-ui --no-build --nocapture
+        continue-on-error: true
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: "EDGAR-Defense-Toolkit-${{ github.ref_name }}-Windows.zip"
+
+      - name: Upload MSI (if built)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: "target/wix/*.msi"
+          if-no-files-found: ignore
+
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          files: |
+            artifacts/macos-dmg/*.dmg
+            artifacts/macos-bbo-csv/*.zip
+            artifacts/windows-zip/*.zip
+            artifacts/windows-msi/*.msi
