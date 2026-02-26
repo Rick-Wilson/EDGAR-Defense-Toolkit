@@ -25,6 +25,11 @@ rayon = "1.10"
 regex = "1.10"
 rust_xlsxwriter = "0.93"
 serde = { version = "1.0", features = ["derive"] }
+ab_glyph = "0.2"
+lopdf = "0.38"
+png = "0.17"
+reqwest = { version = "0.12", features = ["blocking"] }
+zip = "2"
 
 [[bin]]
 name = "bbo-csv"
@@ -37,6 +42,14 @@ path = "src/bin/dd_debug.rs"
 [[bin]]
 name = "edgar-ui"
 path = "src/bin/edgar_ui.rs"
+
+[[bin]]
+name = "pdf-anon"
+path = "src/bin/pdf_anon.rs"
+
+[[bin]]
+name = "docx-anon"
+path = "src/bin/docx_anon.rs"
 
 [dev-dependencies]
 tempfile = "3"

@@ -9,6 +9,7 @@
 //! - `bbo-csv`: Bulk analysis tool for BBO hand record CSVs
 //! - `dd-debug`: Single-hand DD verification utility
 
+pub mod anon_common;
 pub mod dd_analysis;
 pub mod pipeline;
 
