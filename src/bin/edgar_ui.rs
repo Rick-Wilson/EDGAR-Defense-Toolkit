@@ -438,6 +438,10 @@ impl App {
                     &self.case_folder,
                 );
                 self.update_fetch_output();
+                self.anon_input = self.fetch_output.clone();
+                self.update_anon_output();
+                self.analyze_input = self.anon_output.clone();
+                self.update_analyze_output();
                 Task::none()
             }
             Message::DealLimitChanged(v) => {
@@ -448,6 +452,10 @@ impl App {
                     &self.case_folder,
                 );
                 self.update_fetch_output();
+                self.anon_input = self.fetch_output.clone();
+                self.update_anon_output();
+                self.analyze_input = self.anon_output.clone();
+                self.update_analyze_output();
                 Task::none()
             }
 
