@@ -372,13 +372,16 @@ fn main() -> Result<()> {
             if let Some(anon_files) = pipeline::find_anon_files(&edgar_dir, &case_files, limit) {
                 let anon_output = edgar_dir.join(format!("EDGAR Defense {} anon.xlsx", subject));
 
+                // Extract anon subject player names from the anon concise report
+                let anon_subjects = pipeline::parse_concise_usernames(&anon_files.concise_file);
+
                 let anon_config = pipeline::PackageConfig {
                     csv_file: anon_files.csv_file,
                     hotspot_file: anon_files.hotspot_file,
                     concise_file: anon_files.concise_file,
                     output: anon_output.clone(),
                     case_folder: folder.display().to_string(),
-                    subject_players: subjects,
+                    subject_players: anon_subjects,
                     deal_limit: limit,
                     cardplay_file: config.cardplay_file.clone(),
                     is_anon: true,
