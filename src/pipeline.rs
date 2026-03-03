@@ -3209,6 +3209,27 @@ pub fn extract_concise_subject(path: &Path) -> Option<String> {
     }
 }
 
+/// Look for optional board mapping CSVs in the EDGAR Defense folder.
+///
+/// Returns (acbl_boards_file, iba_boards_file) as Options.
+pub fn find_board_mapping_files(
+    edgar_dir: &Path,
+    case_files: &CaseFiles,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let subject = case_files
+        .concise_file
+        .as_deref()
+        .and_then(extract_concise_subject);
+    let subject = match subject {
+        Some(s) => s,
+        None => return (None, None),
+    };
+
+    let acbl = edgar_dir.join(format!("{} acbl boards.csv", subject));
+    let iba = edgar_dir.join(format!("{} iba boards.csv", subject));
+    (acbl.exists().then_some(acbl), iba.exists().then_some(iba))
+}
+
 /// Look for anonymized versions of case files in the EDGAR Defense folder.
 ///
 /// Constructs exact filenames from the subject name and deal limit:
@@ -4099,40 +4120,40 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
     }
 
     // ---------------------------------------------------------------
-    // ACBL Boards sheet (optional, anon workbook only)
+    // ACBL Boards sheet (optional)
     // ---------------------------------------------------------------
     let mut acbl_count: usize = 0;
-    if config.is_anon {
-        if let Some(ref path) = config.acbl_boards_file {
-            if path.exists() {
-                acbl_count = write_board_mapping_sheet(
-                    &mut workbook,
-                    "ACBL Boards",
-                    "ACBL ID",
-                    path,
-                    &header_fmt,
-                    &link_fmt,
-                )?;
-            }
+    if let Some(ref path) = config.acbl_boards_file {
+        if path.exists() {
+            acbl_count = write_board_mapping_sheet(
+                &mut workbook,
+                "ACBL Boards",
+                "ACBL ID",
+                path,
+                config.is_anon,
+                &bbo_col_letter,
+                &header_fmt,
+                &link_fmt,
+            )?;
         }
     }
 
     // ---------------------------------------------------------------
-    // IBA Boards sheet (optional, anon workbook only)
+    // IBA Boards sheet (optional)
     // ---------------------------------------------------------------
     let mut iba_count: usize = 0;
-    if config.is_anon {
-        if let Some(ref path) = config.iba_boards_file {
-            if path.exists() {
-                iba_count = write_board_mapping_sheet(
-                    &mut workbook,
-                    "IBA Boards",
-                    "IBA ID",
-                    path,
-                    &header_fmt,
-                    &link_fmt,
-                )?;
-            }
+    if let Some(ref path) = config.iba_boards_file {
+        if path.exists() {
+            iba_count = write_board_mapping_sheet(
+                &mut workbook,
+                "IBA Boards",
+                "IBA ID",
+                path,
+                config.is_anon,
+                &bbo_col_letter,
+                &header_fmt,
+                &link_fmt,
+            )?;
         }
     }
 
@@ -4167,12 +4188,19 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
 /// Write a board mapping sheet (ACBL Boards or IBA Boards) into the workbook.
 ///
 /// CSV columns expected: Doc_Board, Dataset_Board_ID, Anon_LIN_URL, Fingerprint.
-/// Sheet columns: {first_col_header} | Link (write_url) | Dataset Board ID (hyperlink to Boards).
+/// Sheet columns: {first_col_header} | Link | Dataset Board ID (hyperlink to Boards).
+///
+/// When `is_anon`, the Link column uses `write_url` with the Anon_LIN_URL.
+/// Otherwise, it uses a HYPERLINK formula that looks up the tinyurl via the
+/// Board_ID in the Boards sheet BBO column.
+#[allow(clippy::too_many_arguments)]
 fn write_board_mapping_sheet(
     workbook: &mut rust_xlsxwriter::Workbook,
     sheet_name: &str,
     first_col_header: &str,
     csv_path: &Path,
+    is_anon: bool,
+    bbo_col_letter: &str,
     header_fmt: &rust_xlsxwriter::Format,
     link_fmt: &rust_xlsxwriter::Format,
 ) -> Result<usize> {
@@ -4211,13 +4239,27 @@ fn write_board_mapping_sheet(
             sheet.write_string(row, 0, doc_board)?;
         }
 
-        // Link: write_url with Anon_LIN_URL (URLs exceed 255-char formula limit)
-        if let Some(lin_idx) = anon_lin_url_idx {
-            let lin_url = record.get(lin_idx).unwrap_or("").trim();
-            if !lin_url.is_empty() {
-                let decoded = percent_decode_url(lin_url);
-                let url = Url::new(&decoded).set_text("link");
-                sheet.write_url_with_format(row, 1, &url, link_fmt)?;
+        // Link
+        if let Some(bid_idx) = dataset_board_idx {
+            let bid = record.get(bid_idx).unwrap_or("").trim();
+            if is_anon {
+                // Anon: write_url with Anon_LIN_URL (exceeds 255-char formula limit)
+                if let Some(lin_idx) = anon_lin_url_idx {
+                    let lin_url = record.get(lin_idx).unwrap_or("").trim();
+                    if !lin_url.is_empty() {
+                        let decoded = percent_decode_url(lin_url);
+                        let url = Url::new(&decoded).set_text("link");
+                        sheet.write_url_with_format(row, 1, &url, link_fmt)?;
+                    }
+                }
+            } else if !bid.is_empty() {
+                // Original: HYPERLINK to tinyurl via Board_ID lookup in Boards BBO column
+                let formula = format!(
+                    "HYPERLINK(INDEX(Boards!${col}:${col},MATCH({id},Boards!$A:$A,0)),\"link\")",
+                    col = bbo_col_letter,
+                    id = bid,
+                );
+                sheet.write_formula_with_format(row, 1, Formula::new(formula), link_fmt)?;
             }
         }
 

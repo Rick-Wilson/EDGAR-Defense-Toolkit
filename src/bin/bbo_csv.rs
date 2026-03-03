@@ -347,6 +347,9 @@ fn main() -> Result<()> {
                     .map(|e| e.path())
             });
 
+            let (acbl_boards_file, iba_boards_file) =
+                pipeline::find_board_mapping_files(&edgar_dir, &case_files);
+
             let config = pipeline::PackageConfig {
                 csv_file: csv,
                 hotspot_file: hotspot,
@@ -357,8 +360,8 @@ fn main() -> Result<()> {
                 deal_limit: limit,
                 cardplay_file,
                 is_anon: false,
-                acbl_boards_file: None,
-                iba_boards_file: None,
+                acbl_boards_file,
+                iba_boards_file,
             };
 
             eprintln!("Creating {}...", output.display());

@@ -480,6 +480,10 @@ impl App {
                 } else {
                     None
                 };
+                let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+                let (acbl_boards_file, iba_boards_file) =
+                    pipeline::find_board_mapping_files(&edgar_dir, &self.case_files);
+
                 let config = pipeline::PackageConfig {
                     csv_file: csv,
                     hotspot_file: hotspot,
@@ -490,8 +494,8 @@ impl App {
                     deal_limit: self.deal_limit(),
                     cardplay_file,
                     is_anon: false,
-                    acbl_boards_file: None,
-                    iba_boards_file: None,
+                    acbl_boards_file,
+                    iba_boards_file,
                 };
 
                 // Check for anon files
