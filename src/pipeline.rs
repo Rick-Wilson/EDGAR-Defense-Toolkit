@@ -3556,14 +3556,6 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
     let hit_fill = Format::new().set_background_color("#FFC7CE"); // light pink
     let miss_fill = Format::new().set_background_color("#C6EFCE"); // light green
 
-    // Helper: extract filename from path
-    let extract_filename = |p: &Path| -> String {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("(unknown)")
-            .to_string()
-    };
-
     // Helper: get file modified time as formatted string
     let file_date = |p: &Path| -> String {
         std::fs::metadata(p)
@@ -3636,9 +3628,13 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
         sheet.write_string_with_format(row, 0, "EDGAR Case Package", &title_fmt)?;
         row += 2;
 
-        sheet.write_string_with_format(row, 0, "Case Folder", &bold)?;
-        sheet.write_string_with_format(row, 1, &config.case_folder, &left_fmt)?;
-        row += 2;
+        if !config.is_anon {
+            sheet.write_string_with_format(row, 0, "Case Folder", &bold)?;
+            sheet.write_string_with_format(row, 1, &config.case_folder, &left_fmt)?;
+            row += 2;
+        } else {
+            row += 1;
+        }
 
         // Subject players (one per row)
         sheet.write_string_with_format(row, 0, "Subject Players", &bold)?;
@@ -3651,20 +3647,6 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
                 row += 1;
             }
         }
-        row += 1;
-
-        let csv_name = extract_filename(&config.csv_file);
-        let concise_name = extract_filename(&config.concise_file);
-        let hotspot_name = extract_filename(&config.hotspot_file);
-
-        sheet.write_string_with_format(row, 0, "Hand Records CSV", &bold)?;
-        sheet.write_string_with_format(row, 1, &csv_name, &left_fmt)?;
-        row += 1;
-        sheet.write_string_with_format(row, 0, "Concise Report", &bold)?;
-        sheet.write_string_with_format(row, 1, &concise_name, &left_fmt)?;
-        row += 1;
-        sheet.write_string_with_format(row, 0, "Hotspot Report", &bold)?;
-        sheet.write_string_with_format(row, 1, &hotspot_name, &left_fmt)?;
         row += 2;
 
         sheet.write_string_with_format(row, 0, "CSV Modified", &bold)?;
