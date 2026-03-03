@@ -14,7 +14,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use edgar_defense_toolkit::anon_common::*;
+use regex::Regex;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -67,6 +69,10 @@ enum Commands {
         #[arg(long)]
         pdf: Option<PathBuf>,
 
+        /// DOCX to scan for unmatched tinyurls (alternative to --pdf)
+        #[arg(long)]
+        docx: Option<PathBuf>,
+
         /// Tinyurl lookup CSV
         #[arg(long)]
         lookup: PathBuf,
@@ -83,14 +89,25 @@ enum Commands {
 
 // Shared types and functions imported from edgar_defense_toolkit::anon_common
 
-/// Build deal fingerprint -> (normalized_tinyurl_key, anon_lin_url) index.
+/// Entry in the fingerprint index: Board_ID, normalized tinyurl key, anon LIN URL.
+struct FpEntry {
+    board_id: usize,
+    _tinyurl_key: String,
+    anon_lin: String,
+}
+
+/// Build deal fingerprint -> FpEntry index from lookup + anon CSVs.
 fn build_fingerprint_index(
     lookup_path: &PathBuf,
     anon_path: &PathBuf,
-) -> Result<HashMap<String, (String, String)>> {
+) -> Result<HashMap<String, FpEntry>> {
     let mut lookup_reader =
         csv::Reader::from_path(lookup_path).context("Failed to open lookup CSV")?;
     let lookup_headers = lookup_reader.headers()?.clone();
+    let board_id_idx = lookup_headers
+        .iter()
+        .position(|h| h == "Board_ID")
+        .context("Board_ID column not found")?;
     let tinyurl_idx = lookup_headers
         .iter()
         .position(|h| h == "TinyURL")
@@ -100,11 +117,18 @@ fn build_fingerprint_index(
         .position(|h| h == "LIN_URL")
         .context("LIN_URL column not found in lookup CSV")?;
 
-    let lookup_rows: Vec<(String, String)> = lookup_reader
+    let lookup_rows: Vec<(usize, String, String)> = lookup_reader
         .records()
         .filter_map(|r| r.ok())
         .map(|r| {
+            let bid = r
+                .get(board_id_idx)
+                .unwrap_or("0")
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
             (
+                bid,
                 r.get(tinyurl_idx).unwrap_or("").trim().to_string(),
                 r.get(lin_url_idx).unwrap_or("").trim().to_string(),
             )
@@ -125,16 +149,18 @@ fn build_fingerprint_index(
         .collect();
 
     let mut index = HashMap::new();
-    for (i, (tinyurl, lin_url)) in lookup_rows.iter().enumerate() {
+    for (i, (board_id, tinyurl, lin_url)) in lookup_rows.iter().enumerate() {
         if tinyurl.is_empty() || lin_url.is_empty() {
             continue;
         }
         if let Some(fp) = extract_deal_fingerprint(lin_url) {
             let anon_lin = anon_lins.get(i).cloned().unwrap_or_default();
             if !anon_lin.is_empty() {
-                index
-                    .entry(fp)
-                    .or_insert_with(|| (normalize_tinyurl(tinyurl), anon_lin));
+                index.entry(fp).or_insert_with(|| FpEntry {
+                    board_id: *board_id,
+                    _tinyurl_key: normalize_tinyurl(tinyurl),
+                    anon_lin,
+                });
             }
         }
     }
@@ -142,11 +168,73 @@ fn build_fingerprint_index(
     Ok(index)
 }
 
+/// Build normalized_tinyurl_key -> (board_id, anon_lin, fingerprint) from the
+/// lookup + anon CSVs for direct (non-resolve) lookups.
+fn build_tinyurl_detail_map(
+    lookup_path: &PathBuf,
+    anon_path: &PathBuf,
+) -> Result<HashMap<String, (usize, String, String)>> {
+    let mut lookup_reader =
+        csv::Reader::from_path(lookup_path).context("Failed to open lookup CSV")?;
+    let lookup_headers = lookup_reader.headers()?.clone();
+    let board_id_idx = lookup_headers
+        .iter()
+        .position(|h| h == "Board_ID")
+        .unwrap_or(0);
+    let tinyurl_idx = lookup_headers
+        .iter()
+        .position(|h| h == "TinyURL")
+        .context("TinyURL column not found")?;
+    let lin_url_idx = lookup_headers
+        .iter()
+        .position(|h| h == "LIN_URL")
+        .context("LIN_URL column not found")?;
+
+    let mut anon_reader = csv::Reader::from_path(anon_path).context("Failed to open anon CSV")?;
+    let anon_headers = anon_reader.headers()?.clone();
+    let anon_lin_idx = anon_headers
+        .iter()
+        .position(|h| h == "LIN_URL")
+        .context("LIN_URL column not found in anon CSV")?;
+    let anon_lins: Vec<String> = anon_reader
+        .records()
+        .filter_map(|r| r.ok())
+        .map(|r| r.get(anon_lin_idx).unwrap_or("").trim().to_string())
+        .collect();
+
+    let mut map = HashMap::new();
+    for (i, result) in lookup_reader.records().enumerate() {
+        let r = result?;
+        let bid: usize = r
+            .get(board_id_idx)
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        let tinyurl = r.get(tinyurl_idx).unwrap_or("").trim().to_string();
+        let lin_url = r.get(lin_url_idx).unwrap_or("").trim().to_string();
+        let anon_lin = anon_lins.get(i).cloned().unwrap_or_default();
+        if tinyurl.is_empty() || anon_lin.is_empty() {
+            continue;
+        }
+        let fp = extract_deal_fingerprint(&lin_url).unwrap_or_default();
+        map.insert(normalize_tinyurl(&tinyurl), (bid, anon_lin, fp));
+    }
+    Ok(map)
+}
+
 // ─── PDF helpers ─────────────────────────────────────────────────────────────
 
 /// Extract all tinyurl URIs from a PDF document.
+///
+/// Searches both link annotation objects (`/S /URI`) and page text content
+/// streams (for PDFs where tinyurls appear as rendered text rather than
+/// proper hyperlink annotations).
 fn extract_pdf_tinyurls(doc: &lopdf::Document) -> Vec<String> {
+    let re = Regex::new(r"https?://(?:www\.)?tinyurl\.com/[A-Za-z0-9]+").expect("invalid regex");
     let mut urls = Vec::new();
+
+    // 1. Scan link annotation URI objects
     for obj in doc.objects.values() {
         if let lopdf::Object::Dictionary(ref dict) = obj {
             let is_uri = dict
@@ -164,9 +252,46 @@ fn extract_pdf_tinyurls(doc: &lopdf::Document) -> Vec<String> {
             }
         }
     }
+
+    // 2. Scan page text content streams for tinyurl strings
+    for page_id in doc.get_pages().values() {
+        if let Ok(content) = doc.get_page_content(*page_id) {
+            let text = String::from_utf8_lossy(&content);
+            for m in re.find_iter(&text) {
+                urls.push(m.as_str().to_string());
+            }
+        }
+    }
+
     urls.sort();
     urls.dedup();
     urls
+}
+
+/// Extract unique tinyurl links from a DOCX file's rels XML.
+fn extract_docx_tinyurls(path: &PathBuf) -> Result<Vec<String>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open DOCX: {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    let rels_xml = {
+        let mut entry = archive
+            .by_name("word/_rels/document.xml.rels")
+            .context("No word/_rels/document.xml.rels found in DOCX")?;
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+        buf
+    };
+
+    let re =
+        Regex::new(r#"Target="(https?://(?:www\.)?tinyurl\.com/[^"]+)""#).expect("invalid regex");
+    let mut urls: Vec<String> = re
+        .captures_iter(&rels_xml)
+        .map(|c| c[1].replace("&amp;", "&"))
+        .collect();
+    urls.sort();
+    urls.dedup();
+    Ok(urls)
 }
 
 /// Resolve an indirect reference to the underlying object.
@@ -790,9 +915,15 @@ fn run_replace(
     Ok(())
 }
 
-/// Resolve mode: resolve unmatched ACBL tinyurls and produce a mapping CSV.
+/// Resolve mode: resolve unmatched ACBL tinyurls and produce mapping CSVs.
+///
+/// Produces two files:
+/// 1. `output_path` — extra tinyurl mapping CSV (ACBL_TinyURL, Anon_LIN_URL, Match_Fingerprint)
+/// 2. `{output_stem}_boards.csv` — board index for all document tinyurls
+///    (Doc_Board, Dataset_Board_ID, Anon_LIN_URL, Fingerprint)
 fn run_resolve(
     pdf_path: Option<&PathBuf>,
+    docx_path: Option<&PathBuf>,
     lookup_path: &PathBuf,
     anon_path: &PathBuf,
     output_path: &PathBuf,
@@ -804,21 +935,33 @@ fn run_resolve(
     let fp_index = build_fingerprint_index(lookup_path, anon_path)?;
     println!("  {} unique deal fingerprints indexed", fp_index.len());
 
-    let unmatched: Vec<String> = if let Some(pdf) = pdf_path {
+    println!("Building tinyurl detail map...");
+    let detail_map = build_tinyurl_detail_map(lookup_path, anon_path)?;
+
+    let all_urls = if let Some(docx) = docx_path {
+        println!("\nScanning DOCX for tinyurl links...");
+        let urls = extract_docx_tinyurls(docx)?;
+        println!("  {} unique tinyurls found in DOCX", urls.len());
+        urls
+    } else if let Some(pdf) = pdf_path {
         println!("\nScanning PDF for tinyurl links...");
         let doc = lopdf::Document::load(pdf).context("Failed to load PDF")?;
-        let all_urls = extract_pdf_tinyurls(&doc);
-        println!("  {} unique tinyurls found in PDF", all_urls.len());
-        all_urls
-            .into_iter()
-            .filter(|u| !primary_map.contains_key(&normalize_tinyurl(u)))
-            .collect()
+        let urls = extract_pdf_tinyurls(&doc);
+        println!("  {} unique tinyurls found in PDF", urls.len());
+        urls
     } else {
-        anyhow::bail!("--pdf is required for resolve mode");
+        anyhow::bail!("--pdf or --docx is required for resolve mode");
     };
+
+    let unmatched: Vec<String> = all_urls
+        .iter()
+        .filter(|u| !primary_map.contains_key(&normalize_tinyurl(u)))
+        .cloned()
+        .collect();
 
     println!("  {} unmatched tinyurls to resolve\n", unmatched.len());
 
+    // Resolve unmatched URLs via HTTP redirect + fingerprint matching
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(std::time::Duration::from_secs(15))
@@ -827,6 +970,8 @@ fn run_resolve(
     let mut writer = csv::Writer::from_path(output_path)?;
     writer.write_record(["ACBL_TinyURL", "Anon_LIN_URL", "Match_Fingerprint"])?;
 
+    // Collect resolved entries: tinyurl_key -> (board_id, anon_lin, fingerprint)
+    let mut resolved: HashMap<String, (usize, String, String)> = HashMap::new();
     let mut matched = 0;
     let mut failed = 0;
 
@@ -837,9 +982,10 @@ fn run_resolve(
         match resolve_tinyurl(&client, url) {
             Ok(dest) => {
                 if let Some(fp) = extract_deal_fingerprint(&dest) {
-                    if let Some((_bbo_key, anon_lin)) = fp_index.get(&fp) {
+                    if let Some(entry) = fp_index.get(&fp) {
                         println!("MATCHED (fp: {}...)", &fp[..fp.len().min(12)]);
-                        writer.write_record([url.as_str(), anon_lin.as_str(), &fp])?;
+                        writer.write_record([url.as_str(), entry.anon_lin.as_str(), &fp])?;
+                        resolved.insert(key, (entry.board_id, entry.anon_lin.clone(), fp));
                         matched += 1;
                     } else {
                         println!("no fingerprint match (fp: {}...)", &fp[..fp.len().min(12)]);
@@ -868,6 +1014,48 @@ fn run_resolve(
         unmatched.len()
     );
     println!("Saved to: {}", output_path.display());
+
+    // Write boards index CSV covering all document tinyurls
+    let boards_path = {
+        let stem = output_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let parent = output_path.parent().unwrap_or(std::path::Path::new("."));
+        parent.join(format!("{}_boards.csv", stem))
+    };
+
+    let mut bw = csv::Writer::from_path(&boards_path)?;
+    bw.write_record([
+        "Doc_Board",
+        "Dataset_Board_ID",
+        "Anon_LIN_URL",
+        "Fingerprint",
+    ])?;
+
+    for (doc_idx, url) in all_urls.iter().enumerate() {
+        let key = normalize_tinyurl(url);
+        let (board_id, anon_lin, fp) = if let Some((bid, alin, fp)) = detail_map.get(&key) {
+            (*bid, alin.as_str(), fp.as_str())
+        } else if let Some((bid, alin, fp)) = resolved.get(&key) {
+            (*bid, alin.as_str(), fp.as_str())
+        } else {
+            (0, "", "")
+        };
+        bw.write_record([
+            &(doc_idx + 1).to_string(),
+            &board_id.to_string(),
+            anon_lin,
+            fp,
+        ])?;
+    }
+    bw.flush()?;
+    println!(
+        "Boards index: {} entries -> {}",
+        all_urls.len(),
+        boards_path.display()
+    );
+
     Ok(())
 }
 
@@ -877,10 +1065,11 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Resolve {
             pdf,
+            docx,
             lookup,
             anon,
             output,
-        }) => run_resolve(pdf.as_ref(), &lookup, &anon, &output),
+        }) => run_resolve(pdf.as_ref(), docx.as_ref(), &lookup, &anon, &output),
 
         None => {
             let pdf = cli.pdf.context("--pdf is required")?;

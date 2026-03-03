@@ -1534,7 +1534,15 @@ pub fn derive_lookup_path(output: &Path) -> PathBuf {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let new_stem = stem.replace("cardplay", "tinyurl lookup");
+    // Strip " anon" suffix and deal-limit number (e.g., " 1000") before
+    // replacing "cardplay" with "tinyurl lookup", since the lookup file
+    // has no deal-limited or anon variants.
+    let base = stem.replace(" anon", "");
+    let base = regex::Regex::new(r" \d+( |$)")
+        .unwrap()
+        .replace(&base, "$1")
+        .to_string();
+    let new_stem = base.replace("cardplay", "tinyurl lookup");
     let ext = output
         .extension()
         .unwrap_or_default()
@@ -3092,6 +3100,10 @@ pub struct AnonCaseFiles {
     pub concise_file: PathBuf,
     /// Anonymized hotspot report
     pub hotspot_file: PathBuf,
+    /// Optional ACBL board mapping CSV (e.g., "AWilliams acbl boards.csv")
+    pub acbl_boards_file: Option<PathBuf>,
+    /// Optional IBA board mapping CSV (e.g., "AWilliams iba boards.csv")
+    pub iba_boards_file: Option<PathBuf>,
 }
 
 /// Recursively scan a folder for EDGAR case files (CSV, Concise report, Hotspot report).
@@ -3246,10 +3258,19 @@ pub fn find_anon_files(
         return None;
     }
 
+    // Optional board mapping CSVs (not required for packaging to succeed)
+    let acbl_path = edgar_dir.join(format!("{} acbl boards.csv", subject));
+    let acbl_boards_file = acbl_path.exists().then_some(acbl_path);
+
+    let iba_path = edgar_dir.join(format!("{} iba boards.csv", subject));
+    let iba_boards_file = iba_path.exists().then_some(iba_path);
+
     Some(AnonCaseFiles {
         csv_file: anon_csv,
         concise_file: anon_concise,
         hotspot_file: anon_hotspot,
+        acbl_boards_file,
+        iba_boards_file,
     })
 }
 
@@ -3428,6 +3449,10 @@ pub struct PackageConfig {
     pub cardplay_file: Option<PathBuf>,
     /// Whether this is an anonymized package (changes link handling)
     pub is_anon: bool,
+    /// Optional ACBL board mapping CSV (anon workbooks only)
+    pub acbl_boards_file: Option<PathBuf>,
+    /// Optional IBA board mapping CSV (anon workbooks only)
+    pub iba_boards_file: Option<PathBuf>,
 }
 
 /// Create a packaged Excel workbook from the three EDGAR case files.
@@ -4073,6 +4098,44 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
         }
     }
 
+    // ---------------------------------------------------------------
+    // ACBL Boards sheet (optional, anon workbook only)
+    // ---------------------------------------------------------------
+    let mut acbl_count: usize = 0;
+    if config.is_anon {
+        if let Some(ref path) = config.acbl_boards_file {
+            if path.exists() {
+                acbl_count = write_board_mapping_sheet(
+                    &mut workbook,
+                    "ACBL Boards",
+                    "ACBL ID",
+                    path,
+                    &header_fmt,
+                    &link_fmt,
+                )?;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // IBA Boards sheet (optional, anon workbook only)
+    // ---------------------------------------------------------------
+    let mut iba_count: usize = 0;
+    if config.is_anon {
+        if let Some(ref path) = config.iba_boards_file {
+            if path.exists() {
+                iba_count = write_board_mapping_sheet(
+                    &mut workbook,
+                    "IBA Boards",
+                    "IBA ID",
+                    path,
+                    &header_fmt,
+                    &link_fmt,
+                )?;
+            }
+        }
+    }
+
     // Ensure output directory exists
     if let Some(parent) = config.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -4092,7 +4155,100 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
     if cardplay_count > 0 {
         summary.push_str(&format!("\n  Cardplay: {}", cardplay_count));
     }
+    if acbl_count > 0 {
+        summary.push_str(&format!("\n  ACBL Boards: {}", acbl_count));
+    }
+    if iba_count > 0 {
+        summary.push_str(&format!("\n  IBA Boards: {}", iba_count));
+    }
     Ok(summary)
+}
+
+/// Write a board mapping sheet (ACBL Boards or IBA Boards) into the workbook.
+///
+/// CSV columns expected: Doc_Board, Dataset_Board_ID, Anon_LIN_URL, Fingerprint.
+/// Sheet columns: {first_col_header} | Link (write_url) | Dataset Board ID (hyperlink to Boards).
+fn write_board_mapping_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    sheet_name: &str,
+    first_col_header: &str,
+    csv_path: &Path,
+    header_fmt: &rust_xlsxwriter::Format,
+    link_fmt: &rust_xlsxwriter::Format,
+) -> Result<usize> {
+    use rust_xlsxwriter::{Formula, Url};
+    let csv_data = std::fs::read_to_string(csv_path)
+        .with_context(|| format!("Failed to read board mapping CSV: {}", csv_path.display()))?;
+    let mut reader = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_data.as_bytes());
+    let headers = reader.headers()?.clone();
+
+    let doc_board_idx = headers.iter().position(|h| h == "Doc_Board");
+    let dataset_board_idx = headers.iter().position(|h| h == "Dataset_Board_ID");
+    let anon_lin_url_idx = headers.iter().position(|h| h == "Anon_LIN_URL");
+
+    let sheet = workbook.add_worksheet();
+    sheet.set_name(sheet_name)?;
+
+    sheet.write_string_with_format(0, 0, first_col_header, header_fmt)?;
+    sheet.write_string_with_format(0, 1, "Link", header_fmt)?;
+    sheet.write_string_with_format(0, 2, "Dataset Board ID", header_fmt)?;
+
+    let mut row_count: usize = 0;
+    for result in reader.records() {
+        let record = result.context("Failed to read board mapping CSV row")?;
+        let row = (row_count + 1) as u32;
+
+        // Doc_Board
+        let doc_board = doc_board_idx
+            .and_then(|i| record.get(i))
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if let Ok(n) = doc_board.parse::<f64>() {
+            sheet.write_number(row, 0, n)?;
+        } else {
+            sheet.write_string(row, 0, doc_board)?;
+        }
+
+        // Link: write_url with Anon_LIN_URL (URLs exceed 255-char formula limit)
+        if let Some(lin_idx) = anon_lin_url_idx {
+            let lin_url = record.get(lin_idx).unwrap_or("").trim();
+            if !lin_url.is_empty() {
+                let decoded = percent_decode_url(lin_url);
+                let url = Url::new(&decoded).set_text("link");
+                sheet.write_url_with_format(row, 1, &url, link_fmt)?;
+            }
+        }
+
+        // Dataset Board ID: hyperlink to Boards sheet
+        if let Some(bid_idx) = dataset_board_idx {
+            let bid = record.get(bid_idx).unwrap_or("").trim();
+            if !bid.is_empty() {
+                if let Ok(bid_num) = bid.parse::<u32>() {
+                    let formula = format!(
+                        "HYPERLINK(\"#Boards!A\"&MATCH({id},Boards!$A:$A,0),{id})",
+                        id = bid_num
+                    );
+                    sheet.write_formula_with_format(row, 2, Formula::new(formula), link_fmt)?;
+                } else {
+                    sheet.write_string(row, 2, bid)?;
+                }
+            }
+        }
+
+        row_count += 1;
+    }
+
+    sheet.set_column_width(0, 12)?;
+    sheet.set_column_width(1, 8)?;
+    sheet.set_column_width(2, 18)?;
+
+    if row_count > 0 {
+        sheet.autofilter(0, 0, row_count as u32, 2)?;
+    }
+
+    Ok(row_count)
 }
 
 #[cfg(test)]

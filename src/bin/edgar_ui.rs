@@ -490,6 +490,8 @@ impl App {
                     deal_limit: self.deal_limit(),
                     cardplay_file,
                     is_anon: false,
+                    acbl_boards_file: None,
+                    iba_boards_file: None,
                 };
 
                 // Check for anon files
@@ -532,6 +534,8 @@ impl App {
                         deal_limit: self.deal_limit(),
                         cardplay_file: config.cardplay_file.clone(),
                         is_anon: true,
+                        acbl_boards_file: af.acbl_boards_file,
+                        iba_boards_file: af.iba_boards_file,
                     }
                 });
 
@@ -1619,7 +1623,72 @@ impl App {
                 .into(),
         );
 
-        // File manifest showing what will be created
+        let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+        let subject = self
+            .case_files
+            .concise_file
+            .as_deref()
+            .and_then(pipeline::extract_concise_subject)
+            .unwrap_or_else(|| "Report".to_string());
+        let anon_files = pipeline::find_anon_files(&edgar_dir, &self.case_files, self.deal_limit());
+        let green = iced::Color::from_rgb(0.4, 0.9, 0.4);
+        let gray = iced::Color::from_rgb(0.6, 0.6, 0.6);
+
+        // Input files section
+        let file_status = |name: &str, found: bool| -> Element<'_, Message> {
+            let label = if found {
+                name.to_string()
+            } else {
+                format!("{} (not found)", name)
+            };
+            text(format!("  {}", label))
+                .size(12)
+                .font(iced::Font::MONOSPACE)
+                .color(if found { green } else { gray })
+                .into()
+        };
+
+        let mut input_manifest: Vec<Element<'_, Message>> = Vec::new();
+        input_manifest.push(text("Input files:").size(14).into());
+
+        // Standard anon files
+        let anon_csv_name = match self.deal_limit() {
+            Some(n) => format!("{} {} DD anon.csv", subject, n),
+            None => format!("{} DD anon.csv", subject),
+        };
+        input_manifest.push(file_status(
+            &anon_csv_name,
+            edgar_dir.join(&anon_csv_name).exists(),
+        ));
+
+        let concise_anon = self
+            .case_files
+            .concise_file
+            .as_ref()
+            .and_then(|p| p.file_stem()?.to_str().map(|s| format!("{} anon.txt", s)));
+        if let Some(ref name) = concise_anon {
+            input_manifest.push(file_status(name, edgar_dir.join(name).exists()));
+        }
+
+        let hotspot_anon = self
+            .case_files
+            .hotspot_file
+            .as_ref()
+            .and_then(|p| p.file_stem()?.to_str().map(|s| format!("{} anon.txt", s)));
+        if let Some(ref name) = hotspot_anon {
+            input_manifest.push(file_status(name, edgar_dir.join(name).exists()));
+        }
+
+        // Optional board mapping files
+        let acbl_name = format!("{} acbl boards.csv", subject);
+        input_manifest.push(file_status(&acbl_name, edgar_dir.join(&acbl_name).exists()));
+
+        let iba_name = format!("{} iba boards.csv", subject);
+        input_manifest.push(file_status(&iba_name, edgar_dir.join(&iba_name).exists()));
+
+        items.push(column(input_manifest).spacing(4).into());
+
+        // Output files section
         let mut manifest: Vec<Element<'_, Message>> = Vec::new();
         manifest.push(text("Files to create:").size(14).into());
 
@@ -1634,16 +1703,7 @@ impl App {
                 .into(),
         );
 
-        let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
-        let has_anon =
-            pipeline::find_anon_files(&edgar_dir, &self.case_files, self.deal_limit()).is_some();
-        if has_anon {
-            let subject = self
-                .case_files
-                .concise_file
-                .as_deref()
-                .and_then(pipeline::extract_concise_subject)
-                .unwrap_or_else(|| "Report".to_string());
+        if anon_files.is_some() {
             manifest.push(
                 text(format!("  EDGAR Defense {} anon.xlsx", subject))
                     .size(12)
@@ -1652,10 +1712,10 @@ impl App {
             );
         } else {
             manifest.push(
-                text("  (anon files not found)")
+                text("  (anon workbook skipped — required files missing)")
                     .size(12)
                     .font(iced::Font::MONOSPACE)
-                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                    .color(gray)
                     .into(),
             );
         }

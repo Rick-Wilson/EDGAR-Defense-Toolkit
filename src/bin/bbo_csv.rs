@@ -357,6 +357,8 @@ fn main() -> Result<()> {
                 deal_limit: limit,
                 cardplay_file,
                 is_anon: false,
+                acbl_boards_file: None,
+                iba_boards_file: None,
             };
 
             eprintln!("Creating {}...", output.display());
@@ -377,6 +379,8 @@ fn main() -> Result<()> {
                     deal_limit: limit,
                     cardplay_file: config.cardplay_file.clone(),
                     is_anon: true,
+                    acbl_boards_file: anon_files.acbl_boards_file,
+                    iba_boards_file: anon_files.iba_boards_file,
                 };
 
                 eprintln!("\nCreating {}...", anon_output.display());
