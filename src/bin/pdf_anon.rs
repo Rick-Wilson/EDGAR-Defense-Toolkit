@@ -268,12 +268,18 @@ fn extract_pdf_tinyurls(doc: &lopdf::Document) -> Vec<String> {
     urls
 }
 
-/// Extract unique tinyurl links from a DOCX file's rels XML.
+/// Extract tinyurl links from a DOCX in document order.
+///
+/// Walks `word/document.xml` to find `w:hyperlink r:id="..."` references in
+/// document order, then resolves each rId to its target URL from
+/// `word/_rels/document.xml.rels`.  Returns unique tinyurls preserving
+/// the order they first appear in the document body.
 fn extract_docx_tinyurls(path: &PathBuf) -> Result<Vec<String>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open DOCX: {}", path.display()))?;
     let mut archive = zip::ZipArchive::new(file)?;
 
+    // Read rels to build rId -> URL map
     let rels_xml = {
         let mut entry = archive
             .by_name("word/_rels/document.xml.rels")
@@ -283,14 +289,47 @@ fn extract_docx_tinyurls(path: &PathBuf) -> Result<Vec<String>> {
         buf
     };
 
-    let re =
-        Regex::new(r#"Target="(https?://(?:www\.)?tinyurl\.com/[^"]+)""#).expect("invalid regex");
-    let mut urls: Vec<String> = re
-        .captures_iter(&rels_xml)
-        .map(|c| c[1].replace("&amp;", "&"))
-        .collect();
-    urls.sort();
-    urls.dedup();
+    let id_re = Regex::new(r#"Id="([^"]+)""#).expect("invalid regex");
+    let target_re = Regex::new(r#"Target="([^"]+)""#).expect("invalid regex");
+    let rel_re = Regex::new(r#"<Relationship\s+([^>]+)/>"#).expect("invalid regex");
+
+    let mut rid_to_url: HashMap<String, String> = HashMap::new();
+    for caps in rel_re.captures_iter(&rels_xml) {
+        let attrs = &caps[1];
+        if let (Some(id), Some(target)) = (
+            id_re.captures(attrs).map(|c| c[1].to_string()),
+            target_re
+                .captures(attrs)
+                .map(|c| c[1].replace("&amp;", "&")),
+        ) {
+            if target.contains("tinyurl.com") {
+                rid_to_url.insert(id, target);
+            }
+        }
+    }
+
+    // Walk document.xml to find hyperlinks in document order
+    let doc_xml = {
+        let mut entry = archive
+            .by_name("word/document.xml")
+            .context("No word/document.xml found in DOCX")?;
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+        buf
+    };
+
+    let hl_re = Regex::new(r#"w:hyperlink[^>]*r:id="([^"]+)""#).expect("invalid regex");
+    let mut urls: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for caps in hl_re.captures_iter(&doc_xml) {
+        let rid = &caps[1];
+        if let Some(url) = rid_to_url.get(rid) {
+            if seen.insert(url.clone()) {
+                urls.push(url.clone());
+            }
+        }
+    }
+
     Ok(urls)
 }
 
