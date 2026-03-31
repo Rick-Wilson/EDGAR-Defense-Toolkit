@@ -73,9 +73,18 @@ fn read_bbo_csv_fixed(path: &PathBuf) -> Result<String> {
     let file = File::open(path).context("Failed to open input file")?;
     let reader = BufReader::new(file);
     let mut output = String::new();
+    let mut found_header = false;
 
     for line in reader.lines() {
         let line = line.context("Failed to read line")?;
+        // Skip leading non-header rows (e.g. "Table 1" from hand-edited files)
+        if !found_header {
+            if line.contains(',') {
+                found_header = true;
+            } else {
+                continue;
+            }
+        }
         let fixed = fix_bbo_csv_line(&line);
         output.push_str(&fixed);
         output.push('\n');

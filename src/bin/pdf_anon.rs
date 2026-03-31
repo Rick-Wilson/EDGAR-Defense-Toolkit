@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long)]
     no_images: bool,
 
+    /// Minimum image width to consider as a BBO screenshot (default: 500)
+    #[arg(long, default_value = "500")]
+    min_image_width: usize,
+
     /// Name replacement map for remaining URLs (e.g., "Spwilliams=Bob,Adwilliams=Sally")
     #[arg(long)]
     name_map: Option<String>,
@@ -59,6 +63,10 @@ struct Cli {
     /// Text map file for page text replacement (one "old=new" pair per line)
     #[arg(long)]
     text_map: Option<PathBuf>,
+
+    /// Board mapping CSV to override image player names (Doc_Board,Anon_LIN_URL columns)
+    #[arg(long)]
+    image_board_map: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -343,7 +351,10 @@ fn resolve_obj<'a>(doc: &'a lopdf::Document, obj: &'a lopdf::Object) -> &'a lopd
 
 /// Collect `(image_object_id, lin_url)` pairs for each page that has a BBO
 /// screenshot (large image) and a handviewer link annotation.
-fn collect_page_image_info(doc: &lopdf::Document) -> Vec<(lopdf::ObjectId, String)> {
+fn collect_page_image_info(
+    doc: &lopdf::Document,
+    min_image_width: usize,
+) -> Vec<(lopdf::ObjectId, String)> {
     let mut results = Vec::new();
     let pages = doc.get_pages();
 
@@ -442,7 +453,7 @@ fn collect_page_image_info(doc: &lopdf::Document) -> Vec<(lopdf::ObjectId, Strin
                 })
                 .unwrap_or(0);
 
-            if width > 1000 && height > 1000 {
+            if width >= min_image_width && height >= min_image_width * 2 / 3 {
                 results.push((img_id, lin_url.clone()));
                 break; // one image per page
             }
@@ -454,17 +465,56 @@ fn collect_page_image_info(doc: &lopdf::Document) -> Vec<(lopdf::ObjectId, Strin
 
 // TrueType text rendering and image modification functions are in anon_common.
 
+/// Load a board mapping CSV (Doc_Board, Anon_LIN_URL columns) that maps
+/// document board numbers to the correct anonymized LIN URLs for image
+/// player name extraction.
+fn load_image_board_map(path: &PathBuf) -> Result<HashMap<usize, String>> {
+    let mut reader = csv::Reader::from_path(path)
+        .with_context(|| format!("Failed to open board map CSV: {}", path.display()))?;
+    let headers = reader.headers()?.clone();
+    let board_idx = headers
+        .iter()
+        .position(|h| h == "Doc_Board")
+        .context("Doc_Board column not found in board map CSV")?;
+    let url_idx = headers
+        .iter()
+        .position(|h| h == "Anon_LIN_URL")
+        .context("Anon_LIN_URL column not found in board map CSV")?;
+
+    let mut map = HashMap::new();
+    for record in reader.records() {
+        let record = record?;
+        let board: usize = record.get(board_idx).unwrap_or("").parse().unwrap_or(0);
+        let url = record.get(url_idx).unwrap_or("").to_string();
+        if board > 0 && !url.is_empty() {
+            map.insert(board, url);
+        }
+    }
+    Ok(map)
+}
+
 /// Process all BBO screenshot images in the document, overwriting player name
 /// areas with anonymized names extracted from the page's link annotation URL.
-fn anonymize_bbo_images(doc: &mut lopdf::Document) -> Result<u32> {
+/// If `board_url_map` is provided, uses it to look up the correct URL per board
+/// instead of the page's link annotation (which may be duplicated).
+fn anonymize_bbo_images(
+    doc: &mut lopdf::Document,
+    min_image_width: usize,
+    board_url_map: Option<&HashMap<usize, String>>,
+) -> Result<u32> {
     let font = load_system_font()?;
 
     // First pass: collect image object IDs and their associated LIN URLs
-    let image_info = collect_page_image_info(doc);
+    let image_info = collect_page_image_info(doc, min_image_width);
     let mut modified = 0u32;
 
-    for (img_id, lin_url) in &image_info {
-        let names = match extract_player_names(lin_url) {
+    for (board_num, (img_id, lin_url)) in image_info.iter().enumerate() {
+        // Use board map URL if available, otherwise fall back to page annotation URL
+        let effective_url = match board_url_map {
+            Some(map) => map.get(&(board_num + 1)).unwrap_or(lin_url),
+            None => lin_url,
+        };
+        let names = match extract_player_names(effective_url) {
             Some(n) => n,
             None => {
                 eprintln!(
@@ -549,7 +599,7 @@ fn anonymize_bbo_images(doc: &mut lopdf::Document) -> Result<u32> {
             img_id,
             width,
             height,
-            lin_url.len(),
+            effective_url.len(),
             names[2],
             names[0],
             names[1],
@@ -730,6 +780,10 @@ fn replace_page_text(
     // original kerning and cursor advance.  If the replacement is shorter,
     // remaining matched positions are set to space (0x20).
     for (block_bytes, block_locs) in &blocks {
+        // Track which byte positions have already been replaced so that
+        // shorter rules don't clobber earlier, longer matches.
+        let mut replaced = vec![false; block_bytes.len()];
+
         for (search, replace) in replacements {
             if search.is_empty() {
                 continue;
@@ -743,6 +797,13 @@ fn replace_page_text(
             while start + search.len() <= block_bytes.len() {
                 if let Some(pos) = find_subsequence(&block_bytes[start..], search) {
                     let abs_pos = start + pos;
+
+                    // Skip if any position in this range was already replaced
+                    if replaced[abs_pos..abs_pos + search.len()].iter().any(|&r| r) {
+                        start = abs_pos + 1;
+                        continue;
+                    }
+
                     let match_locs = &block_locs[abs_pos..abs_pos + search.len()];
 
                     let mut any_written = false;
@@ -762,6 +823,11 @@ fn replace_page_text(
                     if any_written {
                         changed = true;
                         total += 1;
+                    }
+
+                    // Mark these positions as replaced
+                    for r in &mut replaced[abs_pos..abs_pos + search.len()] {
+                        *r = true;
                     }
 
                     start = abs_pos + search.len();
@@ -830,6 +896,8 @@ fn run_replace(
     anon_images: bool,
     name_map: Option<&str>,
     text_map_path: Option<&PathBuf>,
+    min_image_width: usize,
+    image_board_map_path: Option<&PathBuf>,
 ) -> Result<()> {
     println!("Building URL mapping...");
     let mut url_map = build_url_mapping(lookup_path, anon_path)?;
@@ -945,7 +1013,19 @@ fn run_replace(
     // ── Anonymize BBO screenshot images ──
     if anon_images {
         println!("\nAnonymizing BBO screenshot images...");
-        let img_count = anonymize_bbo_images(&mut doc)?;
+        let board_url_map = match image_board_map_path {
+            Some(path) => {
+                let map = load_image_board_map(path)?;
+                println!(
+                    "  Loaded {} board URL overrides from {}",
+                    map.len(),
+                    path.display()
+                );
+                Some(map)
+            }
+            None => None,
+        };
+        let img_count = anonymize_bbo_images(&mut doc, min_image_width, board_url_map.as_ref())?;
         println!("Modified {} BBO screenshot images", img_count);
     }
 
@@ -1124,6 +1204,8 @@ fn main() -> Result<()> {
                 !cli.no_images,
                 cli.name_map.as_deref(),
                 cli.text_map.as_ref(),
+                cli.min_image_width,
+                cli.image_board_map.as_ref(),
             )
         }
     }

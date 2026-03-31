@@ -172,16 +172,15 @@ impl App {
                     app.update_anon_output();
                     app.analyze_input = app.anon_output.clone();
                     app.update_analyze_output();
+                    app.stats_input = app.analyze_output.clone();
+                    app.display_input = app.analyze_output.clone();
                 }
 
-                let default_names = ["Bob", "Sally"];
-                let map_parts: Vec<String> = app
-                    .case_usernames
-                    .iter()
-                    .zip(default_names.iter())
-                    .map(|(user, alias)| format!("{}={}", user, alias))
-                    .collect();
-                app.anon_map = map_parts.join(",");
+                app.anon_map = load_or_generate_anon_map(
+                    &p,
+                    &app.case_usernames,
+                    app.case_files.csv_file.as_deref(),
+                );
 
                 let subject = app
                     .case_files
@@ -402,15 +401,12 @@ impl App {
                         self.update_analyze_output();
                     }
 
-                    // Default mappings: first subject = Bob, second = Sally
-                    let default_names = ["Bob", "Sally"];
-                    let map_parts: Vec<String> = self
-                        .case_usernames
-                        .iter()
-                        .zip(default_names.iter())
-                        .map(|(user, alias)| format!("{}={}", user, alias))
-                        .collect();
-                    self.anon_map = map_parts.join(",");
+                    // Load existing text map or generate deterministic aliases
+                    self.anon_map = load_or_generate_anon_map(
+                        &p,
+                        &self.case_usernames,
+                        self.case_files.csv_file.as_deref(),
+                    );
 
                     // Auto-derive package output path
                     let subject = self
@@ -857,6 +853,8 @@ impl App {
                         Some(TabId::Anonymize) => {
                             self.analyze_input = self.anon_output.clone();
                             self.update_analyze_output();
+                            // Save anon mappings to text map file
+                            save_anon_text_map(&self.case_folder, &self.anon_map);
                         }
                         Some(TabId::Analyze) => {
                             self.stats_input = self.analyze_output.clone();
@@ -1167,14 +1165,23 @@ impl App {
 
             // ETA calculation — exclude skipped rows from rate so resume doesn't
             // inflate the speed estimate with instantly-processed cached rows.
+            // Wait until 5% progress or 3 seconds elapsed for a stable estimate.
             if let Some(start) = self.fetch_start_time {
                 let fetched = self
                     .progress_completed
                     .saturating_sub(self.progress_skipped);
                 let remaining_items = self.progress_total.saturating_sub(self.progress_completed);
+                let elapsed = start.elapsed();
+                let pct = if self.progress_total > 0 {
+                    self.progress_completed as f64 / self.progress_total as f64
+                } else {
+                    0.0
+                };
 
-                if fetched > 0 && self.progress_total > 0 {
-                    let elapsed = start.elapsed();
+                if fetched > 0
+                    && self.progress_total > 0
+                    && (pct >= 0.05 || elapsed.as_secs_f64() >= 3.0)
+                {
                     let rate = fetched as f64 / elapsed.as_secs_f64();
                     let remaining_secs = if rate > 0.0 {
                         remaining_items as f64 / rate
@@ -1445,15 +1452,24 @@ impl App {
             );
             items.push(text(progress_text).size(13).into());
 
-            // ETA calculation — exclude skipped rows from rate
+            // ETA calculation — exclude skipped rows from rate.
+            // Wait until 5% progress or 3 seconds elapsed for a stable estimate.
             if let Some(start) = self.fetch_start_time {
                 let processed = self
                     .progress_completed
                     .saturating_sub(self.progress_skipped);
                 let remaining_items = self.progress_total.saturating_sub(self.progress_completed);
+                let elapsed = start.elapsed();
+                let pct = if self.progress_total > 0 {
+                    self.progress_completed as f64 / self.progress_total as f64
+                } else {
+                    0.0
+                };
 
-                if processed > 0 && self.progress_total > 0 {
-                    let elapsed = start.elapsed();
+                if processed > 0
+                    && self.progress_total > 0
+                    && (pct >= 0.05 || elapsed.as_secs_f64() >= 3.0)
+                {
                     let rate = processed as f64 / elapsed.as_secs_f64();
                     let remaining_secs = if rate > 0.0 {
                         remaining_items as f64 / rate
@@ -1655,15 +1671,15 @@ impl App {
         let mut input_manifest: Vec<Element<'_, Message>> = Vec::new();
         input_manifest.push(text("Input files:").size(14).into());
 
-        // Standard anon files
-        let anon_csv_name = match self.deal_limit() {
-            Some(n) => format!("{} {} DD anon.csv", subject, n),
-            None => format!("{} DD anon.csv", subject),
-        };
-        input_manifest.push(file_status(
-            &anon_csv_name,
-            edgar_dir.join(&anon_csv_name).exists(),
-        ));
+        // Standard anon files — search for the actual DD anon CSV
+        let dd_anon_found = anon_files.as_ref().map(|f| &f.csv_file);
+        let anon_csv_name = dd_anon_found
+            .and_then(|p| p.file_name()?.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| match self.deal_limit() {
+                Some(n) => format!("{} {} DD anon.csv", subject, n),
+                None => format!("{} DD anon.csv", subject),
+            });
+        input_manifest.push(file_status(&anon_csv_name, dd_anon_found.is_some()));
 
         let concise_anon = self
             .case_files
@@ -1826,6 +1842,76 @@ fn add_suffix_to_filename(input: &str, suffix: &str) -> String {
     dir.join(format!("{} {}.csv", stem, suffix))
         .display()
         .to_string()
+}
+
+/// Name of the text map file saved in the EDGAR Defense folder.
+const ANON_TEXT_MAP_FILENAME: &str = "anon_text_map.txt";
+
+/// Load anon mappings from an existing text map file, or generate defaults.
+///
+/// If `anon_text_map.txt` exists in the EDGAR Defense folder, reads it and
+/// returns the mappings as a comma-separated string (e.g. "user1=Alice,user2=Dan").
+/// Otherwise, generates deterministic aliases from a hash of the CSV filename
+/// and returns the default mappings.
+fn load_or_generate_anon_map(
+    case_folder: &Path,
+    usernames: &[String],
+    csv_file: Option<&Path>,
+) -> String {
+    let edgar_dir = case_folder.join("EDGAR Defense");
+    let text_map_path = edgar_dir.join(ANON_TEXT_MAP_FILENAME);
+
+    // Try loading existing text map
+    if text_map_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&text_map_path) {
+            let mut mappings = Vec::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if line.contains('=') {
+                    mappings.push(line.to_string());
+                }
+            }
+            if !mappings.is_empty() {
+                return mappings.join(",");
+            }
+        }
+    }
+
+    // Generate deterministic aliases from CSV filename
+    let seed = csv_file
+        .and_then(|p| p.file_name()?.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "default".to_string());
+    let aliases = pipeline::generate_aliases(&seed, usernames.len());
+
+    let map_parts: Vec<String> = usernames
+        .iter()
+        .zip(aliases.iter())
+        .map(|(user, alias)| format!("{}={}", user, alias))
+        .collect();
+    map_parts.join(",")
+}
+
+/// Save the current anon map to the EDGAR Defense folder as `anon_text_map.txt`.
+fn save_anon_text_map(case_folder: &str, anon_map: &str) {
+    let edgar_dir = Path::new(case_folder).join("EDGAR Defense");
+    let _ = std::fs::create_dir_all(&edgar_dir);
+    let text_map_path = edgar_dir.join(ANON_TEXT_MAP_FILENAME);
+
+    let mut lines = vec![
+        "# Anonymization name mappings".to_string(),
+        "# Format: original_name=AnonymizedName (one per line)".to_string(),
+    ];
+    for mapping in anon_map.split(',') {
+        let mapping = mapping.trim();
+        if !mapping.is_empty() {
+            lines.push(mapping.to_string());
+        }
+    }
+    let content = lines.join("\n") + "\n";
+    let _ = std::fs::write(&text_map_path, content);
 }
 
 /// Derive analyze DD output: replace "cardplay" with "DD", or append " DD".

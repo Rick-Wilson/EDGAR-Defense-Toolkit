@@ -1693,9 +1693,18 @@ fn read_bbo_csv_fixed(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path).context("Failed to open input file")?;
     let reader = BufReader::new(file);
     let mut output = String::new();
+    let mut found_header = false;
 
     for line in reader.lines() {
         let line = line.context("Failed to read line")?;
+        // Skip leading non-header rows (e.g. "Table 1" from hand-edited files)
+        if !found_header {
+            if line.contains(',') {
+                found_header = true;
+            } else {
+                continue;
+            }
+        }
         let fixed = fix_bbo_csv_line(&line);
         output.push_str(&fixed);
         output.push('\n');
@@ -2280,30 +2289,72 @@ impl Anonymizer {
     }
 }
 
+/// Generate deterministic alias names from a seed string (e.g. CSV filename).
+/// Returns a list of first names derived from a hash, one per player.
+pub fn generate_aliases(seed: &str, count: usize) -> Vec<String> {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in seed.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    let mut names = Vec::new();
+    let mut used = std::collections::HashSet::new();
+    for i in 0..count {
+        let h = hash.wrapping_add(i as u64).wrapping_mul(0x100000001b3);
+        let idx = (h % FIRST_NAMES.len() as u64) as usize;
+        let mut name = FIRST_NAMES[idx].to_string();
+        let mut suffix = 2;
+        while used.contains(&name) {
+            name = format!("{}_{}", FIRST_NAMES[idx], suffix);
+            suffix += 1;
+        }
+        used.insert(name.clone());
+        names.push(name);
+    }
+    names
+}
+
 /// Anonymize player names embedded in a BBO LIN URL.
 fn anonymize_lin_url(url: &str, anonymizer: &mut Anonymizer) -> String {
     use regex::Regex;
 
+    // Handle percent-encoded format: pn%7Cname1%2Cname2%2Cname3%2Cname4%7C
+    // Use string search instead of regex since names can contain %2B and other
+    // percent-encoded chars that make regex matching fragile.
+    let result = if let Some(start) = url.to_ascii_lowercase().find("pn%7c").map(|i| i + 5) {
+        if let Some(end_rel) = url[start..].to_ascii_lowercase().find("%7c") {
+            let names_str = &url[start..start + end_rel];
+            let anon_names: Vec<String> = names_str
+                .split("%2C")
+                .map(|name| {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        String::new()
+                    } else {
+                        // Decode %2B → + so names match the CSV text columns
+                        let decoded = name.replace("%2B", "+");
+                        anonymizer.anonymize(&decoded)
+                    }
+                })
+                .collect();
+            format!(
+                "{}pn%7C{}%7C{}",
+                &url[..start - 5],
+                anon_names.join("%2C"),
+                &url[start + end_rel + 3..]
+            )
+        } else {
+            url.to_string()
+        }
+    } else {
+        url.to_string()
+    };
+
+    // Handle literal format: pn|name1,name2,name3,name4|
     lazy_static::lazy_static! {
-        static ref PN_ENCODED: Regex = Regex::new(r"(?i)pn%7C([^%]+(?:%2C[^%]+)*)%7C").unwrap();
         static ref PN_LITERAL: Regex = Regex::new(r"pn\|([^|]+)\|").unwrap();
     }
-
-    let result = PN_ENCODED.replace(url, |caps: &regex::Captures| {
-        let names_str = &caps[1];
-        let anon_names: Vec<String> = names_str
-            .split("%2C")
-            .map(|name| {
-                let name = name.trim();
-                if name.is_empty() {
-                    String::new()
-                } else {
-                    anonymizer.anonymize(name)
-                }
-            })
-            .collect();
-        format!("pn%7C{}%7C", anon_names.join("%2C"))
-    });
 
     let result = PN_LITERAL.replace(&result, |caps: &regex::Captures| {
         let names = &caps[1];
@@ -2802,12 +2853,24 @@ fn dd_find_required_columns(headers: &StringRecord) -> Result<DdColumnIndices> {
             .ok_or_else(|| anyhow::anyhow!("Required column '{}' not found", name))
     };
 
+    let find_any = |names: &[&str]| -> Result<usize> {
+        for name in names {
+            if let Some(idx) = headers.iter().position(|h| h == *name) {
+                return Ok(idx);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Required column not found (tried: {})",
+            names.join(", ")
+        ))
+    };
+
     let find_optional = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
 
     Ok(DdColumnIndices {
         ref_col: find("Ref #")?,
         cardplay_col: find("Cardplay")?,
-        contract_col: find("Con")?,
+        contract_col: find_any(&["Con", "Table Contract", "Official Contract"])?,
         declarer_col: find("Dec")?,
         max_dd_col: find_optional("Max DD"),
         dec_hand_col: find("Dec Hand")?,
@@ -2822,12 +2885,27 @@ fn dd_find_required_columns(headers: &StringRecord) -> Result<DdColumnIndices> {
 /// Maps role-based hand columns (Dec Hand, Dummy Hand, Leader Hand, Third Hand)
 /// to compass positions using the Dec column.
 fn dd_extract_row_data(record: &StringRecord, cols: &DdColumnIndices) -> Option<DdRowData> {
-    let contract = record.get(cols.contract_col)?.to_string();
+    let raw_contract = record.get(cols.contract_col)?.to_string();
     let declarer = record.get(cols.declarer_col)?.to_string();
 
-    if contract.is_empty() || declarer.is_empty() {
+    if raw_contract.is_empty() || declarer.is_empty() {
         return None;
     }
+
+    // Normalize "Table Contract" format: "3NN" → "3N", "4SW" → "4S"
+    // The last char is the declarer (already in Dec column), strip it if the
+    // contract is 3+ chars and the last char matches a compass direction.
+    let contract = if raw_contract.len() >= 3
+        && matches!(
+            raw_contract.as_bytes()[raw_contract.len() - 1],
+            b'N' | b'S' | b'E' | b'W' | b'n' | b's' | b'e' | b'w'
+        )
+        && raw_contract.as_bytes()[0].is_ascii_digit()
+    {
+        raw_contract[..raw_contract.len() - 1].to_string()
+    } else {
+        raw_contract
+    };
 
     let dec_hand = record.get(cols.dec_hand_col).unwrap_or("");
     let dummy_hand = record.get(cols.dummy_hand_col).unwrap_or("");
@@ -3131,8 +3209,14 @@ fn scan_dir_recursive(dir: &Path, result: &mut CaseFiles) {
             scan_dir_recursive(&path, result);
         } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             let lower = name.to_lowercase();
-            if lower.ends_with(".csv") && result.csv_file.is_none() {
-                result.csv_file = Some(path);
+            if lower.ends_with(".csv") {
+                // Prefer BBO/ACBL export files (start with YYYYMMDD_ pattern)
+                let is_bbo_export = lower.len() >= 9
+                    && lower[..8].chars().all(|c| c.is_ascii_digit())
+                    && lower.as_bytes()[8] == b'_';
+                if result.csv_file.is_none() || is_bbo_export {
+                    result.csv_file = Some(path);
+                }
             } else if lower.ends_with(".txt")
                 && lower.contains("concise")
                 && result.concise_file.is_none()
@@ -3265,26 +3349,13 @@ pub fn find_anon_files(
         }
     })?;
 
-    // Construct anon CSV filename: "{subject} [N] DD anon.csv"
-    let subject = case_files
-        .concise_file
-        .as_deref()
-        .and_then(extract_concise_subject)?;
-    let anon_csv_name = match deal_limit {
-        Some(n) => format!("{} {} DD anon.csv", subject, n),
-        None => format!("{} DD anon.csv", subject),
-    };
-    let anon_csv = edgar_dir.join(&anon_csv_name);
-    if !anon_csv.exists() {
-        return None;
-    }
+    // Find the DD anon CSV by scanning the EDGAR Defense directory.
+    // The filename is derived from the input CSV stem (not the concise report),
+    // so we search for files ending in "DD anon.csv" with an optional deal limit.
+    let anon_csv = find_dd_anon_csv(edgar_dir, deal_limit)?;
 
     // Optional board mapping CSVs (not required for packaging to succeed)
-    let acbl_path = edgar_dir.join(format!("{} acbl boards.csv", subject));
-    let acbl_boards_file = acbl_path.exists().then_some(acbl_path);
-
-    let iba_path = edgar_dir.join(format!("{} iba boards.csv", subject));
-    let iba_boards_file = iba_path.exists().then_some(iba_path);
+    let (acbl_boards_file, iba_boards_file) = find_board_mapping_files(edgar_dir, case_files);
 
     Some(AnonCaseFiles {
         csv_file: anon_csv,
@@ -3293,6 +3364,25 @@ pub fn find_anon_files(
         acbl_boards_file,
         iba_boards_file,
     })
+}
+
+/// Find a DD anon CSV in the EDGAR Defense directory.
+/// Matches files ending in "DD anon.csv", optionally with a deal limit number.
+fn find_dd_anon_csv(edgar_dir: &Path, deal_limit: Option<usize>) -> Option<PathBuf> {
+    let suffix = match deal_limit {
+        Some(n) => format!(" {} DD anon.csv", n),
+        None => " DD anon.csv".to_string(),
+    };
+
+    let entries = std::fs::read_dir(edgar_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_str()?;
+        if name_str.ends_with(&suffix) {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -3587,6 +3677,33 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
     let e_col_csv = headers.iter().position(|h| h == "E");
     let w_col_csv = headers.iter().position(|h| h == "W");
 
+    // Find Dec and DD per-seat columns for subject player DD stats
+    let dec_col_csv = headers.iter().position(|h| h == "Dec");
+    let dd_match_col_csv = headers.iter().position(|h| h == "DD_Match");
+    let dd_n_plays_csv = headers.iter().position(|h| h == "DD_N_Plays");
+    let dd_s_plays_csv = headers.iter().position(|h| h == "DD_S_Plays");
+    let dd_e_plays_csv = headers.iter().position(|h| h == "DD_E_Plays");
+    let dd_w_plays_csv = headers.iter().position(|h| h == "DD_W_Plays");
+    let dd_n_errors_csv = headers.iter().position(|h| h == "DD_N_Errors");
+    let dd_s_errors_csv = headers.iter().position(|h| h == "DD_S_Errors");
+    let dd_e_errors_csv = headers.iter().position(|h| h == "DD_E_Errors");
+    let dd_w_errors_csv = headers.iter().position(|h| h == "DD_W_Errors");
+
+    // Build subject DD column names if we have both subject players and DD data
+    let subject_dd_cols: Vec<String> = if dd_match_col_csv.is_some()
+        && dd_n_plays_csv.is_some()
+        && !config.subject_players.is_empty()
+    {
+        config
+            .subject_players
+            .iter()
+            .flat_map(|name| vec![format!("DD_{}_Plays", name), format!("DD_{}_Errors", name)])
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let num_subject_dd_cols = subject_dd_cols.len() as u16;
+
     // Number of extra columns inserted after OB (Overcaller, Responder, Advancer)
     let extra_cols: u16 = if ob_col_csv.is_some() { 3 } else { 0 };
 
@@ -3595,21 +3712,25 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
 
     // Map a CSV column index to its Boards sheet column, accounting for inserted columns
     let boards_col = |csv_idx: usize| -> u16 {
+        let mut col = csv_col_offset + csv_idx as u16;
         if let Some(ob) = ob_col_csv {
             if csv_idx > ob {
-                csv_col_offset + csv_idx as u16 + extra_cols
-            } else {
-                csv_col_offset + csv_idx as u16
+                col += extra_cols;
             }
-        } else {
-            csv_col_offset + csv_idx as u16
         }
+        if let Some(dd_match) = dd_match_col_csv {
+            if csv_idx > dd_match {
+                col += num_subject_dd_cols;
+            }
+        }
+        col
     };
 
     // BBO column position in Boards sheet
     let bbo_col_boards = boards_col(bbo_col_csv);
     // Total Boards columns = 4 + number of CSV headers + extra inserted columns
-    let boards_last_col = csv_col_offset + headers.len() as u16 - 1 + extra_cols;
+    let boards_last_col =
+        csv_col_offset + headers.len() as u16 - 1 + extra_cols + num_subject_dd_cols;
 
     // BBO column letter for Hotspots INDEX/MATCH formula
     let bbo_col_letter = col_letter(bbo_col_boards as u32);
@@ -3740,6 +3861,14 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
             sheet.write_string_with_format(0, insert_at + 2, "Advancer", &header_fmt)?;
         }
 
+        // Insert subject DD columns after DD_Match
+        if let Some(dd_match) = dd_match_col_csv {
+            let insert_at = boards_col(dd_match) + 1;
+            for (k, col_name) in subject_dd_cols.iter().enumerate() {
+                sheet.write_string_with_format(0, insert_at + k as u16, col_name, &header_fmt)?;
+            }
+        }
+
         // Data rows
         for (i, record) in records.iter().enumerate() {
             let row = (i + 1) as u32;
@@ -3841,6 +3970,94 @@ pub fn package_workbook(config: &PackageConfig) -> Result<String> {
                         sheet.write_string(row, insert_at, overcaller)?;
                         sheet.write_string(row, insert_at + 1, responder)?;
                         sheet.write_string(row, insert_at + 2, advancer)?;
+                    }
+                }
+            }
+
+            // Write subject DD plays/errors columns
+            if let Some(dd_match) = dd_match_col_csv {
+                if !subject_dd_cols.is_empty() && dd_n_plays_csv.is_some() {
+                    let get_player = |col: Option<usize>| -> &str {
+                        col.and_then(|c| record.get(c))
+                            .map(|s| s.trim())
+                            .unwrap_or("")
+                    };
+                    let n_name = get_player(n_col_csv).to_lowercase();
+                    let s_name = get_player(s_col_csv).to_lowercase();
+                    let e_name = get_player(e_col_csv).to_lowercase();
+                    let w_name = get_player(w_col_csv).to_lowercase();
+
+                    let get_dd = |col: Option<usize>| -> f64 {
+                        col.and_then(|c| record.get(c))
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                    };
+
+                    // Determine declarer seat to combine declarer+dummy plays
+                    let dec_seat = dec_col_csv
+                        .and_then(|c| record.get(c))
+                        .map(|s| s.trim().to_uppercase())
+                        .unwrap_or_default();
+                    let (dec_name, dummy_name) = match dec_seat.as_str() {
+                        "N" => (n_name.as_str(), s_name.as_str()),
+                        "S" => (s_name.as_str(), n_name.as_str()),
+                        "E" => (e_name.as_str(), w_name.as_str()),
+                        "W" => (w_name.as_str(), e_name.as_str()),
+                        _ => ("", ""),
+                    };
+
+                    let seat_plays = [
+                        (
+                            n_name.as_str(),
+                            get_dd(dd_n_plays_csv),
+                            get_dd(dd_n_errors_csv),
+                        ),
+                        (
+                            s_name.as_str(),
+                            get_dd(dd_s_plays_csv),
+                            get_dd(dd_s_errors_csv),
+                        ),
+                        (
+                            e_name.as_str(),
+                            get_dd(dd_e_plays_csv),
+                            get_dd(dd_e_errors_csv),
+                        ),
+                        (
+                            w_name.as_str(),
+                            get_dd(dd_w_plays_csv),
+                            get_dd(dd_w_errors_csv),
+                        ),
+                    ];
+
+                    let insert_at = boards_col(dd_match) + 1;
+                    for (pi, player) in config.subject_players.iter().enumerate() {
+                        let player_lower = player.to_lowercase();
+                        // Find this player's seat data
+                        let own = seat_plays.iter().find(|(name, _, _)| *name == player_lower);
+                        let own = match own {
+                            Some(o) => o,
+                            None => continue,
+                        };
+
+                        // If this player is declarer, sum declarer + dummy plays/errors
+                        // If this player is dummy, also sum declarer + dummy (credited to declarer)
+                        let (plays, errors) =
+                            if player_lower == dec_name || player_lower == dummy_name {
+                                let partner = seat_plays.iter().find(|(name, _, _)| {
+                                    (*name == dummy_name && player_lower == dec_name)
+                                        || (*name == dec_name && player_lower == dummy_name)
+                                });
+                                match partner {
+                                    Some(p) => (own.1 + p.1, own.2 + p.2),
+                                    None => (own.1, own.2),
+                                }
+                            } else {
+                                (own.1, own.2)
+                            };
+
+                        let col_offset = insert_at + (pi as u16 * 2);
+                        sheet.write_number(row, col_offset, plays)?;
+                        sheet.write_number(row, col_offset + 1, errors)?;
                     }
                 }
             }

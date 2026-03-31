@@ -93,7 +93,9 @@ pub fn extract_player_names(url: &str) -> Option<[String; 4]> {
         .replace("%7C", "|")
         .replace("%7c", "|")
         .replace("%2C", ",")
-        .replace("%2c", ",");
+        .replace("%2c", ",")
+        .replace("%2B", "+")
+        .replace("%2b", "+");
 
     // Try |pn| first, then =pn| (first field after lin= query param)
     let pn_start = decoded
