@@ -855,105 +855,124 @@ pub fn compute_stats(input: &Path, top_n: usize) -> Result<String> {
     writeln!(out, "Processed {} deals ({} skipped)", processed, skipped)?;
     writeln!(out, "Found {} unique players\n", player_stats.len())?;
 
-    writeln!(out, "{:=^126}", " DD Error Rate Analysis ")?;
-    writeln!(
-        out,
-        "\n{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10} {:>10} {:>8}",
-        "Player",
-        "Deals",
-        "Decl",
-        "Def",
-        "Decl Plays",
-        "Decl Err%",
-        "Def Plays",
-        "Def Err%",
-        "Diff",
-        "Rel%"
-    )?;
-    writeln!(out, "{:-<126}", "")?;
-
-    for player in players.iter().take(top_n) {
-        let decl_rate = player.declaring_error_rate();
-        let def_rate = player.defending_error_rate();
-        let diff = decl_rate - def_rate;
+    // Helper to format one stats row
+    let format_row = |out: &mut String,
+                      label: &str,
+                      stats: &PlayerStats,
+                      is_subject: bool|
+     -> std::fmt::Result {
+        let decl_rate = stats.declaring_error_rate();
+        let def_rate = stats.defending_error_rate();
+        let decl_ci = stats.declaring_ci();
+        let def_ci = stats.defending_ci();
+        let diff = def_rate - decl_rate;
         let rel_pct = if decl_rate > 0.0 {
-            -diff / decl_rate * 100.0
+            diff / decl_rate * 100.0
         } else {
             0.0
         };
 
+        // Low confidence: CI exceeds error rate or CI > 5%
+        let low_conf = (!decl_ci.is_nan() && decl_ci > decl_rate.max(5.0))
+            || (!def_ci.is_nan() && def_ci > def_rate.max(5.0));
+        let marker = if is_subject {
+            "*"
+        } else if low_conf {
+            "~"
+        } else {
+            " "
+        };
+
+        let decl_ci_str = if decl_ci.is_nan() {
+            "".to_string()
+        } else {
+            format!("{:.2}%", decl_ci)
+        };
+        let def_ci_str = if def_ci.is_nan() {
+            "".to_string()
+        } else {
+            format!("{:.2}%", def_ci)
+        };
+
         writeln!(
             out,
-            "{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
-            truncate_name(&player.name, 20),
-            player.total_deals,
-            player.declaring_deals,
-            player.defending_deals,
-            player.declaring_plays,
+            "{}{:<19} {:>5} {:>5} {:>5} {:>6} {:>6.2}% {:>6} {:>6} {:>6.2}% {:>6} {:>7} {:>7}",
+            marker,
+            truncate_name(label, 19),
+            stats.total_deals,
+            stats.declaring_deals,
+            stats.defending_deals,
+            stats.declaring_plays,
             decl_rate,
-            player.defending_plays,
+            decl_ci_str,
+            stats.defending_plays,
             def_rate,
-            diff,
-            rel_pct
-        )?;
+            def_ci_str,
+            format!("{:+.2}%", diff),
+            format!("{:+.1}%", rel_pct),
+        )
+    };
 
-        let decl_ci = player.declaring_ci();
-        let def_ci = player.defending_ci();
-        if !decl_ci.is_nan() || !def_ci.is_nan() {
-            writeln!(
-                out,
-                "{:<20} {:>8} {:>6} {:>6} {:>12} {:>10} {:>12} {:>10}",
-                "",
-                "",
-                "",
-                "",
-                format!("(\u{00b1}{:.2}%)", decl_ci),
-                "",
-                format!("(\u{00b1}{:.2}%)", def_ci),
-                ""
-            )?;
-        }
+    //                    marker + name        Deals  Decl   Def   Plays  Err%   ±95%  Plays  Err%   ±95%   Diff    Rel%
+    writeln!(out, "{:=^105}", " DD Error Rate Analysis ")?;
+    writeln!(
+        out,
+        "\n{:<20} {:>5} {:>5} {:>5} {:>6} {:>7} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7}",
+        "", "", "", "", "Decl", "Decl", "Decl", "Def", "Def", "Def", "Def-", ""
+    )?;
+    writeln!(
+        out,
+        "{:<20} {:>5} {:>5} {:>5} {:>6} {:>7} {:>6} {:>6} {:>7} {:>6} {:>7} {:>7}",
+        "Player",
+        "Deals",
+        "Decl",
+        "Def",
+        "Plays",
+        "Err%",
+        "\u{00b1}95%",
+        "Plays",
+        "Err%",
+        "\u{00b1}95%",
+        "Decl",
+        "Rel%"
+    )?;
+    writeln!(out, "{:-<105}", "")?;
+
+    for player in players.iter().take(top_n) {
+        let is_subject = top_2.contains(&player.name);
+        format_row(&mut out, &player.name, player, is_subject)?;
     }
 
     // Field aggregate
-    writeln!(out, "{:-<126}", "")?;
-    let decl_rate = field_stats.declaring_error_rate();
-    let def_rate = field_stats.defending_error_rate();
-    let diff = decl_rate - def_rate;
-    let rel_pct = if decl_rate > 0.0 {
-        -diff / decl_rate * 100.0
-    } else {
-        0.0
-    };
+    writeln!(out, "{:-<105}", "")?;
+    // FIELD has many observations, so mark as high confidence (green)
+    let field_ci = field_stats.declaring_ci();
+    let field_high_conf =
+        !field_ci.is_nan() && field_ci <= field_stats.declaring_error_rate().max(5.0);
+    format_row(&mut out, "FIELD (others)", &field_stats, field_high_conf)?;
 
-    writeln!(
-        out,
-        "{:<20} {:>8} {:>6} {:>6} {:>12} {:>9.2}% {:>12} {:>9.2}% {:>+9.2}% {:>+7.1}%",
-        "FIELD (others)",
-        field_stats.total_deals,
-        field_stats.declaring_deals,
-        field_stats.defending_deals,
-        field_stats.declaring_plays,
-        decl_rate,
-        field_stats.defending_plays,
-        def_rate,
-        diff,
-        rel_pct
-    )?;
-
-    writeln!(out, "\n{:=^100}", "")?;
+    writeln!(out, "\n{:=^105}", "")?;
     writeln!(out, "\nInterpretation:")?;
+    writeln!(out, "  Green rows:  subject players (high confidence)")?;
     writeln!(
         out,
-        "  - Decl Err%: Percentage of plays with DD cost > 0 when declaring/dummy"
+        "  Gray rows:   low confidence (95% CI exceeds the error rate)"
     )?;
     writeln!(
         out,
-        "  - Def Err%:  Percentage of plays with DD cost > 0 when defending"
+        "  Decl Err%:   Percentage of declaring-side plays with DD cost > 0"
     )?;
     writeln!(
         out,
-        "  - Diff:      Decl% - Def% (negative means more errors on defense)"
+        "  Def Err%:    Percentage of defending plays with DD cost > 0"
+    )?;
+    writeln!(
+        out,
+        "  \u{00b1}95%:       Wilson score 95% confidence interval for the error rate"
+    )?;
+    writeln!(
+        out,
+        "  Def-Decl:    Def Err% minus Decl Err% (negative = fewer errors defending)"
     )?;
 
     Ok(out)
@@ -1792,19 +1811,37 @@ impl PlayerStats {
         if self.declaring_plays < 30 {
             return f64::NAN;
         }
-        let p = self.declaring_errors as f64 / self.declaring_plays as f64;
-        let n = self.declaring_plays as f64;
-        1.96 * (p * (1.0 - p) / n).sqrt() * 100.0
+        wilson_ci_half_width(self.declaring_errors as f64, self.declaring_plays as f64)
     }
 
     fn defending_ci(&self) -> f64 {
         if self.defending_plays < 30 {
             return f64::NAN;
         }
-        let p = self.defending_errors as f64 / self.defending_plays as f64;
-        let n = self.defending_plays as f64;
-        1.96 * (p * (1.0 - p) / n).sqrt() * 100.0
+        wilson_ci_half_width(self.defending_errors as f64, self.defending_plays as f64)
     }
+}
+
+/// Wilson score 95% confidence interval half-width (as a percentage).
+///
+/// Unlike the Wald interval, the Wilson interval gives sensible bounds
+/// when p is near 0 or 1, avoiding the degenerate ±0% at the boundaries.
+fn wilson_ci_half_width(errors: f64, plays: f64) -> f64 {
+    let z = 1.96_f64; // 95% confidence
+    let z2 = z * z;
+    let p = errors / plays;
+    let n = plays;
+
+    let denom = 1.0 + z2 / n;
+    let centre = (p + z2 / (2.0 * n)) / denom;
+    let margin = (z / denom) * ((p * (1.0 - p) / n) + (z2 / (4.0 * n * n))).sqrt();
+
+    // Return the half-width as a percentage
+    // (distance from observed proportion to interval edge, whichever is larger)
+    let lo = centre - margin;
+    let hi = centre + margin;
+    let half = ((p - lo).abs()).max((hi - p).abs());
+    half * 100.0
 }
 
 // ============================================================================
@@ -3167,6 +3204,8 @@ pub struct CaseFiles {
     pub concise_file: Option<PathBuf>,
     /// Hotspot EDGAR report text file
     pub hotspot_file: Option<PathBuf>,
+    /// EDGAR Defense output folder (found or created near the CSV file)
+    pub edgar_dir: Option<PathBuf>,
 }
 
 /// Anonymized versions of case files found in the EDGAR Defense folder.
@@ -3188,6 +3227,18 @@ pub struct AnonCaseFiles {
 pub fn scan_case_folder(folder: &Path) -> CaseFiles {
     let mut result = CaseFiles::default();
     scan_dir_recursive(folder, &mut result);
+
+    // If no EDGAR Defense folder was found, create one as a sibling of the CSV
+    // file's parent directory (or directly under the case folder).
+    if result.edgar_dir.is_none() {
+        let parent = result
+            .csv_file
+            .as_ref()
+            .and_then(|p| p.parent())
+            .unwrap_or(folder);
+        result.edgar_dir = Some(parent.join("EDGAR Defense"));
+    }
+
     result
 }
 
@@ -3201,9 +3252,10 @@ fn scan_dir_recursive(dir: &Path, result: &mut CaseFiles) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip EDGAR Defense output folder to avoid picking up generated files
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if dir_name == "EDGAR Defense" {
+                // Record the EDGAR Defense folder but don't scan inside it
+                result.edgar_dir = Some(path);
                 continue;
             }
             scan_dir_recursive(&path, result);

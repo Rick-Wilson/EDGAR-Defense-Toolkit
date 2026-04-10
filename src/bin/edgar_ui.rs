@@ -245,7 +245,11 @@ impl App {
         if self.fetch_input.is_empty() || self.case_folder.is_empty() {
             return;
         }
-        let edgar_dir = Path::new(&self.case_folder).join("EDGAR Defense");
+        let edgar_dir = self
+            .case_files
+            .edgar_dir
+            .clone()
+            .unwrap_or_else(|| Path::new(&self.case_folder).join("EDGAR Defense"));
         let csv_stem = Path::new(&self.fetch_input)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -377,8 +381,12 @@ impl App {
                     );
                     self.case_files = pipeline::scan_case_folder(&p);
 
-                    // Create EDGAR Defense subfolder
-                    let edgar_dir = p.join("EDGAR Defense");
+                    // Create EDGAR Defense subfolder (near the CSV file, not always at root)
+                    let edgar_dir = self
+                        .case_files
+                        .edgar_dir
+                        .clone()
+                        .unwrap_or_else(|| p.join("EDGAR Defense"));
                     let _ = std::fs::create_dir_all(&edgar_dir);
 
                     // Parse subject usernames from concise report
@@ -399,6 +407,8 @@ impl App {
                         // Pre-populate analyze input from anonymize output
                         self.analyze_input = self.anon_output.clone();
                         self.update_analyze_output();
+                        self.stats_input = self.analyze_output.clone();
+                        self.display_input = self.analyze_output.clone();
                     }
 
                     // Load existing text map or generate deterministic aliases
@@ -1553,24 +1563,42 @@ impl App {
         }
 
         let results = if !self.stats_result.is_empty() {
+            // Render each line with color based on row marker prefix:
+            //   * = subject player (bright white/green)
+            //   ~ = low confidence (dim gray)
+            //   (other) = normal
+            let mono = iced::Font::MONOSPACE;
+            let lines_col: Element<'_, Message> = {
+                let mut col = column![].spacing(0);
+                for line in self.stats_result.lines() {
+                    let (display, color) = if let Some(rest) = line.strip_prefix('*') {
+                        (rest, iced::Color::from_rgb(0.4, 1.0, 0.4)) // green
+                    } else if let Some(rest) = line.strip_prefix('~') {
+                        (rest, iced::Color::from_rgb(0.45, 0.45, 0.45)) // dim
+                    } else if let Some(rest) = line.strip_prefix(' ') {
+                        (rest, iced::Color::from_rgb(0.8, 0.8, 0.8)) // normal
+                    } else {
+                        (line, iced::Color::from_rgb(0.8, 0.8, 0.8)) // normal (no prefix)
+                    };
+                    col = col.push(text(display).size(12).font(mono).color(color));
+                }
+                col.into()
+            };
+
             column![
                 text("Results:").size(13),
-                scrollable(
-                    container(
-                        text(&self.stats_result)
-                            .size(12)
-                            .font(iced::Font::MONOSPACE)
-                    )
-                    .padding(8)
-                )
-                .height(350),
+                scrollable(container(lines_col).padding(8)).height(Fill),
             ]
             .spacing(4)
+            .height(Fill)
         } else {
             column![]
         };
 
-        column![form, row![run_btn], results].spacing(16).into()
+        column![form, row![run_btn], results]
+            .spacing(16)
+            .height(Fill)
+            .into()
     }
 
     // -- Display Hand tab --
