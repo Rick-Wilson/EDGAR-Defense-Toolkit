@@ -10,7 +10,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 /// Opening lead hotspot categories (vs bidding-related ones)
-const LEAD_CATEGORIES: &[&str] = &["Kxx_vsSuit", "Weird_OLs", "Ax+_Low"];
+const LEAD_CATEGORIES: &[&str] = &["Kxx_vsSuit", "Weird_OLs", "Ax+_Low", "Suit_Overeasy"];
 
 #[derive(Parser)]
 #[command(name = "hotspot-report")]
