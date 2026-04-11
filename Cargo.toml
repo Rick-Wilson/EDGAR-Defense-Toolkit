@@ -51,5 +51,9 @@ path = "src/bin/pdf_anon.rs"
 name = "docx-anon"
 path = "src/bin/docx_anon.rs"
 
+[[bin]]
+name = "hotspot-report"
+path = "src/bin/hotspot_report.rs"
+
 [dev-dependencies]
 tempfile = "3"
